@@ -32,6 +32,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     acknowledged INTEGER NOT NULL DEFAULT 0,
     seq INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS task_batches (
+    task_id TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    row_level INTEGER NOT NULL,
+    weight_kg REAL,
+    duration_s REAL NOT NULL,
+    offset_s REAL NOT NULL,
+    PRIMARY KEY (task_id, batch_id)
+);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id TEXT,
@@ -169,6 +178,32 @@ class TaskStore:
             if event:
                 self._insert_event(c, *event[:2], task_id=task_id, data=event[2] if len(event) > 2 else None)
         return self.get_task(task_id)
+
+    def add_batch(self, task_id, batch_id, row_level, weight_kg, duration_s, offset_s,
+                  task_duration_s, row_levels, batch_count, event=None):
+        """Record a batch added to a running task and extend the task, in one transaction."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO task_batches(task_id, batch_id, row_level, weight_kg, duration_s, offset_s) "
+                "VALUES(?, ?, ?, ?, ?, ?)",
+                (task_id, batch_id, row_level, weight_kg, duration_s, offset_s),
+            )
+            c.execute(
+                "UPDATE tasks SET duration_s=?, row_levels=?, batch_count=?, seq=seq+1 WHERE task_id=?",
+                (task_duration_s, row_levels, batch_count, task_id),
+            )
+            if event:
+                self._insert_event(c, *event[:2], task_id=task_id, data=event[2] if len(event) > 2 else None)
+        return self.get_task(task_id)
+
+    def list_batches(self, task_id):
+        rows = self._conn().execute(
+            "SELECT * FROM task_batches WHERE task_id=? ORDER BY offset_s, rowid", (task_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def batch_exists(self, task_id, batch_id):
+        return self._conn().execute(
+            "SELECT 1 FROM task_batches WHERE task_id=? AND batch_id=?", (task_id, batch_id)).fetchone() is not None
 
     def get_task(self, task_id):
         return _row(self._conn().execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone())

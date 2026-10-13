@@ -13,13 +13,14 @@
           "request": {
             ".write": "auth != null && auth.uid === 'MmpK3i6OsnR6RbSGMRHm2M9U5cJ2'",
             ".validate": "newData.hasChildren(['command', 'requested_at'])",
-            "command": { ".validate": "newData.isString() && newData.val().matches(/^(start|cancel|resume|abort|acknowledge)$/)" },
+            "command": { ".validate": "newData.isString() && newData.val().matches(/^(start|add_batch|cancel|resume|abort|acknowledge)$/)" },
             "task_id": { ".validate": "newData.isString() && newData.val().matches(/^[A-Za-z0-9_-]{1,64}$/)" },
             "command_id": { ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length <= 128" },
             "requested_at": { ".validate": "newData.val() == now" },
             "duration_minutes": { ".validate": "newData.isNumber() && newData.val() > 0 && newData.val() <= 10080" },
             "batch_count": { ".validate": "newData.isNumber() && newData.val() >= 1 && newData.val() <= 100" },
             "row_levels": { ".validate": "newData.isString() && newData.val().length <= 64 && newData.val().matches(/^[0-9]+( *, *[0-9]+)*$/)" },
+            "batch_id": { ".validate": "newData.isString() && newData.val().matches(/^[A-Za-z0-9_-]{1,64}$/)" },
             "weight_kg": { ".validate": "newData.isNumber() && newData.val() > 0" },
             "requested_by": { ".validate": "newData.isString() && newData.val().length <= 128" },
             "$other": { ".validate": false }

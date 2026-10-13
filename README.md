@@ -104,11 +104,13 @@ The schema follows the web app. Security rules are in `database.rules.json`. The
 
 - `command` is one of these:
   - `start`
+  - `add_batch` (adds one batch to the running task, see below)
   - `cancel` (a running task, or one waiting for recovery)
   - `resume` (only from `recovery_required`)
   - `abort` (gives up a task in `recovery_required`)
   - `acknowledge` (clears a `failed` task so a new one can start)
 - `task_id` must match `[A-Za-z0-9_-]{1,64}` and can never be reused. For commands other than `start` it's optional; if sent, it must match the current task.
+- `add_batch` needs the running `task_id`, a new `batch_id` (`[A-Za-z0-9_-]{1,64}`), `duration_minutes` for that batch alone, and exactly one free `row_levels` entry (`weight_kg` optional). The batch is timed from the moment it is added. The task is extended if the batch would finish after the task's current end, and is never shortened. The relays, the running clock and the batches already drying are untouched. Rejected with `task_not_running`, `task_mismatch`, `row_occupied`, `duplicate_batch`, `invalid_batch_id`, `invalid_row_levels`, `invalid_duration`, `invalid_weight`, `invalid_batch_count`, `not_ready` or `sensor_unavailable`.
 - `row_levels` is a comma-separated list of rows. Every row must be in `ALLOWED_ROW_LEVELS`, with no duplicates.
 - `weight_kg` is optional.
 - `requested_at` must be the server timestamp. Each request is processed **exactly once**, identified by `command_id` if one is sent, otherwise by `task_id + command + requested_at`. Reading the same request again after a reconnect or reboot does nothing.
@@ -117,7 +119,8 @@ The schema follows the web app. Security rules are in `database.rules.json`. The
 **The Pi writes** (the web app only reads these):
 
 - `task/ack`: `{command_id, command, task_id, result: accepted|rejected|duplicate, reason, at}`. The request has been processed once `task/ack.command_id` equals your `command_id`, or `"<task_id>:<command>:<requested_at>"` when you don't send one. Read `requested_at` back from `task/request` to get the resolved server time. Until then it has **not been processed yet**. `reason` explains a rejection, e.g. `too_hot`, `invalid_row_levels`, `unacknowledged_failure`.
-- `task/report`: `{task_id, status, seq, boot_id, started_at, ended_at, duration_minutes, elapsed_seconds, remaining_seconds, progress_percent, batch_count, row_levels, weight_kg, reason, detail, acknowledged, reported_at}`
+- `task/report`: `{task_id, status, seq, boot_id, started_at, ended_at, duration_minutes, elapsed_seconds, remaining_seconds, progress_percent, batch_count, row_levels, weight_kg, reason, detail, acknowledged, batches, reported_at}`
+  - `batches` lists the batches added with `add_batch`: `{batch_id, row_level, offset_seconds, duration_minutes, elapsed_seconds, remaining_seconds, progress_percent}`. Each is measured from when it was added. `[]` when none were added.
   - `status` is `starting`, `running`, `completed`, `cancelled`, `failed`, `recovering` or `recovery_required`.
   - `reason` is set for failures and recovery holds, e.g. `possible_power_loss`.
   - `detail` is a short readable summary. The full diagnostics are in `events`.

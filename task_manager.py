@@ -145,7 +145,24 @@ class TaskManager:
                 "reason": t["failure_reason"],
                 "detail": _detail(t["diagnostics"]),
                 "acknowledged": bool(t["acknowledged"]),
+                "batches": self._batch_snapshots(t["task_id"], elapsed),
             }
+
+    def _batch_snapshots(self, task_id, task_elapsed):
+        """Per-batch timing for batches added mid-task, each measured from when it was added."""
+        out = []
+        for b in self.store.list_batches(task_id):
+            elapsed = min(b["duration_s"], max(0.0, task_elapsed - b["offset_s"]))
+            out.append({
+                "batch_id": b["batch_id"],
+                "row_level": b["row_level"],
+                "offset_seconds": round(b["offset_s"], 1),
+                "duration_minutes": round(b["duration_s"] / 60.0, 2),
+                "elapsed_seconds": round(elapsed, 1),
+                "remaining_seconds": round(b["duration_s"] - elapsed, 1),
+                "progress_percent": round(100.0 * elapsed / b["duration_s"], 1),
+            })
+        return out
 
     # ---------------- startup / shutdown ----------------
     def startup(self, prev_boot_id, clean_shutdown):
@@ -333,6 +350,7 @@ class TaskManager:
                 self._check_age(cmd)
                 handler = {
                     "start": self._cmd_start,
+                    "add_batch": self._cmd_add_batch,
                     "cancel": self._cmd_cancel,
                     "resume": self._cmd_resume,
                     "abort": self._cmd_abort,
@@ -405,6 +423,57 @@ class TaskManager:
         now = self.mono()
         self._begin_running(0.0, now, ("task_running", "drying started", {"temp_c": temp}),
                             started_wall=self.wall())
+
+    def _cmd_add_batch(self, cmd, task_id):
+        """Add one batch to the running task without touching the relays or the running clock.
+
+        The batch is timed from now. The task is only extended, never shortened, so batches
+        already drying keep their own end times.
+        """
+        cfg = self.cfg
+        if task_id is None or not TASK_ID_RE.match(task_id):
+            raise Rejected("invalid_task_id")
+        batch_id = cmd.get("batch_id")
+        if not isinstance(batch_id, str) or not TASK_ID_RE.match(batch_id):
+            raise Rejected("invalid_batch_id")
+        w, dur = cmd.get("weight_kg"), cmd.get("duration_minutes")
+        rows = parse_row_levels(cmd.get("row_levels"), cfg.ALLOWED_ROW_LEVELS)
+        if w is not None and not (_number(w) and 0 < w <= cfg.MAX_WEIGHT_KG):
+            raise Rejected("invalid_weight")
+        if rows is None or "," in rows:
+            raise Rejected("invalid_row_levels")  # exactly one row per added batch
+        if not (_number(dur) and cfg.MIN_DURATION_MIN <= dur <= cfg.MAX_DURATION_MIN):
+            raise Rejected("invalid_duration")
+
+        if not self.initialized or self.recovery is not None:
+            raise Rejected("not_ready")
+        if self.task is None or self.task["status"] != "running":
+            raise Rejected("task_not_running")
+        if task_id != self.task["task_id"]:
+            raise Rejected("task_mismatch")
+        if self.store.batch_exists(task_id, batch_id):
+            raise Rejected("duplicate_batch", "duplicate")
+        current_rows = self.task["row_levels"].split(",")
+        if rows in current_rows:
+            raise Rejected("row_occupied")
+        if self.task["batch_count"] + 1 > cfg.MAX_BATCH_COUNT:
+            raise Rejected("invalid_batch_count")
+        if self.sensor.temp() is None:
+            raise Rejected("sensor_unavailable")  # no too_hot check: the thermostat already holds the heat
+
+        now = self.mono()
+        offset = self.elapsed(now)
+        batch_s = float(dur) * 60.0
+        task_s = max(self.task["duration_s"], offset + batch_s)
+        if task_s > cfg.MAX_DURATION_MIN * 60.0:
+            raise Rejected("invalid_duration")
+        self.task = self.store.add_batch(
+            task_id, batch_id, int(rows), float(w) if w is not None else None, batch_s, offset,
+            task_s, ",".join(sorted(current_rows + [rows], key=int)), self.task["batch_count"] + 1,
+            event=("batch_added", "batch added to the running task",
+                   {"command_id": cmd["command_id"], "batch_id": batch_id, "row_level": rows,
+                    "duration_minutes": dur, "offset_s": round(offset, 1),
+                    "task_duration_s": task_s, "requested_by": cmd.get("requested_by")}))
 
     def _require_task(self, task_id, statuses):
         if self.task is None:
