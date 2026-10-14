@@ -172,7 +172,7 @@ def test_events_logged_in_order(rig):
     rig.run(4)
     rig.cmd("cancel", "T1")
     types = [e["type"] for e in rig.store.pending_events(100)]
-    assert types == ["task_accepted", "task_running", "task_cancelled"]
+    assert types == ["task_accepted", "task_warming_up", "task_running", "task_cancelled"]
 
 
 def test_fresh_boot_without_task_is_ready(tmp_path):

@@ -42,6 +42,7 @@ class CloudSync:
         self._last_manual = None
         self._last_settings = None
         self._last_publish = None
+        self._last_log_upload = None        # when per-minute temperature summaries last went out
         self._last_settings_poll = None
         self._last_sig = None               # machine state as last published, minus temp
         self._state_dirty = False
@@ -193,8 +194,23 @@ class CloudSync:
         updates["state/pending_events"] = max(0, store.pending_count() - len(events))
         updates["state/last_seen"] = SERVER_TS
 
+        # The Pi keeps every sample locally; Firebase only gets one summary per minute so a
+        # long run stays small. A backlog after an outage is sent without waiting for the interval.
+        minutes = []
+        if self._last_log_upload is None or now - self._last_log_upload >= self.cfg.TEMP_LOG_UPLOAD_SECONDS:
+            minutes = store.pending_temp_minutes(self.cfg.TEMP_LOG_BATCH)
+            for m in minutes:
+                updates[f"task_logs/{m['task_id']}/{m['minute']:08d}"] = {
+                    "t": m["minute"] * 60000, "avg": round(m["sum_c"] / m["n"], 2),
+                    "min": round(m["min_c"], 2), "max": round(m["max_c"], 2),
+                    "raw": round(m["raw_last"], 2), "n": m["n"],
+                }
+
         self._base.update(updates)
 
+        store.mark_temp_minutes_uploaded([(m["task_id"], m["minute"], m["n"]) for m in minutes])
+        if len(minutes) < self.cfg.TEMP_LOG_BATCH:
+            self._last_log_upload = now
         store.mark_uploaded([e["id"] for e in events])
         with self._lock:
             for path, value in writes.items():

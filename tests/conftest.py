@@ -126,13 +126,23 @@ class Rig:
             self.tm.tick()
             t += step
 
-    def start(self, task_id="T1", duration_min=10, **kw):
+    def start(self, task_id="T1", duration_min=10, warmup=False, **kw):
+        """Send a start command.
+
+        Most tests are about drying, so by default the task is moved straight into drying the
+        way the warm-up hand-over does it. Pass warmup=True to exercise the real warm-up phase.
+        """
         self._n += 1
         cmd = {"command_id": kw.pop("command_id", f"c{self._n}-{task_id}"), "command": "start",
                "task_id": task_id, "weight_kg": 2.5, "batch_count": 20, "row_levels": "2",
                "duration_minutes": duration_min}
         cmd.update(kw)
-        return self.tm.handle_command(cmd)
+        ack = self.tm.handle_command(cmd)
+        if ack and ack["result"] == "accepted" and not warmup:
+            self.tm._begin_running(0.0, self.tm.mono(), ("task_running", "drying started", {}),
+                                   drying_started_wall=self.clock.wall,
+                                   target_confirmed_wall=self.clock.wall)
+        return ack
 
     def cmd(self, action, task_id=None, **kw):
         self._n += 1
@@ -173,7 +183,8 @@ def _pins():
     for r in Rig.instances:  # close explicitly, GC-time close deadlocks gpiozero's pin lock
         r.crash()
     Rig.instances.clear()
-    Device.pin_factory.reset()
+    if Device.pin_factory is not None:  # pure-logic tests never create a device
+        Device.pin_factory.reset()
 
 
 @pytest.fixture

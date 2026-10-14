@@ -42,6 +42,25 @@ TASK_SETPOINT_C = TEMP_MAX_C - TEMP_RESUME_DROP  # thermostat target during a ta
 TASK_HYSTERESIS_C = 2.0         # heater back on at setpoint - hysteresis
 CHECKPOINT_SECONDS = 10         # how often running-task progress is saved to disk
 
+# ---------------- warm-up before drying ----------------
+# A task starts WARMING_UP and only becomes drying (status "running") once the smoothed chamber
+# temperature has held the target band for the dwell. Every value here is copied into the task
+# when it starts, so editing this file never changes a session that is already running.
+# sample_interval and sensor_fail_limit are SENSOR_INTERVAL and SENSOR_BAD_LIMIT, set with the sensor.
+MEDIAN_WINDOW = 5               # moving-median window, in samples
+# Wider than TASK_HYSTERESIS_C: the thermostat lets the chamber sag by the hysteresis on every
+# cycle, so a tighter band would drop out of "reached" during normal regulation.
+TARGET_TOLERANCE_C = 2.5        # reached = smoothed temperature >= target - tolerance
+DWELL_SECONDS = 60              # ...continuously for this long
+DWELL_MAX_GAP_SECONDS = SENSOR_INTERVAL * 2.5  # a missing sample restarts the dwell
+WARMUP_TIMEOUT_SECONDS = 3 * 3600  # target not confirmed by then -> FAULT, heater off
+DIP_WARNING_LIMIT_SECONDS = 600  # a drying-phase dip below the band this long raises a warning
+MAX_TEMP_CUTOFF_C = min(TASK_SETPOINT_C + 10.0, TEMP_MAX_C)  # software over-temperature fault
+TEMP_PLAUSIBLE_MIN_C = -10.0    # outside this range a reading counts as a failed read
+TEMP_PLAUSIBLE_MAX_C = 100.0
+TEMP_LOG_UPLOAD_SECONDS = 60    # per-minute temperature summaries go to Firebase this often
+TEMP_LOG_BATCH = 500            # summary minutes per write, so catching up after an outage stays small
+
 # cooling after a task ends: heater off at once, fan runs until the measured temperature is safe
 COOLDOWN_SAFE_TEMP_C = 40.0     # default; the web app can change it (settings/safe_temp_c)
 COOLDOWN_SAFE_TEMP_MIN_C = 25.0  # mirrors database.rules.json

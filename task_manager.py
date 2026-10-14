@@ -4,12 +4,17 @@ import re
 import sqlite3
 import threading
 import time
+from statistics import median
 
 import config
 import recovery
+import warmup
 from machine_settings import HeaterCutoff, MachineSettings
+from task_store import SNAPSHOT_FIELDS
 
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+MODES = ("standard", "experiment")
+HEATING_STATUSES = ("warming_up", "running")  # the thermostat is live in these
 
 
 def _number(v):
@@ -70,6 +75,33 @@ def _detail(diag):
     return "; ".join(parts)[:200] or None
 
 
+def session_snapshot(cfg):
+    """Everything a session runs with, frozen at start so later config edits cannot change it."""
+    return {
+        "target_c": float(cfg.TASK_SETPOINT_C),
+        "tolerance_c": float(cfg.TARGET_TOLERANCE_C),
+        "hysteresis_c": float(cfg.TASK_HYSTERESIS_C),
+        "dwell_s": float(cfg.DWELL_SECONDS),
+        "median_window": int(cfg.MEDIAN_WINDOW),
+        "warmup_timeout_s": float(cfg.WARMUP_TIMEOUT_SECONDS),
+        "dip_limit_s": float(cfg.DIP_WARNING_LIMIT_SECONDS),
+        "max_temp_c": float(cfg.MAX_TEMP_CUTOFF_C),
+    }
+
+
+def snapshot_valid(task):
+    """A task whose frozen settings are missing or nonsensical must never drive the heater."""
+    try:
+        v = {k: task[k] for k in SNAPSHOT_FIELDS}
+    except (KeyError, TypeError):
+        return False
+    if not all(_number(x) for x in v.values()):
+        return False
+    return (0 < v["target_c"] < v["max_temp_c"] and v["tolerance_c"] > 0 and v["hysteresis_c"] > 0
+            and v["dwell_s"] > 0 and v["median_window"] >= 1 and v["warmup_timeout_s"] > 0
+            and v["dip_limit_s"] > 0)
+
+
 class Rejected(Exception):
     def __init__(self, reason, result="rejected"):
         super().__init__(reason)
@@ -95,11 +127,22 @@ class TaskManager:
         self.segment_start = None   # monotonic start of the current running segment
         self.elapsed_base = 0.0     # running time accumulated before this segment
         self.last_checkpoint = 0.0
+        self.warm_base = 0.0        # powered-on warm-up time accumulated before this segment
+        self.warm_segment_start = None
+        self.detector = None        # warmup.TargetDetector, rebuilt from the task's own snapshot
+        self.dips = None            # warmup.DipTracker, drying phase only
+        self._seen_reads = 0
+        self._log_buf = []          # temperature samples waiting for the next checkpoint
         self.recovery = None        # observation state while deciding after a restart
         self.cooling = None         # {"start": monotonic} while the fan runs the machine down
         self.settings = MachineSettings(store, cfg)  # persisted on the Pi, loaded here on every boot
         self.cutoff = HeaterCutoff(store, cfg.HEATER_CUTOFF_MARGIN_C)
         self.initialized = False
+        if cfg.TARGET_TOLERANCE_C < cfg.TASK_HYSTERESIS_C:
+            msg = ("TARGET_TOLERANCE_C is below TASK_HYSTERESIS_C: normal heater cycling can leave the "
+                   "band, so the target may never be confirmed")
+            print("warning:", msg)
+            store.log_event("config_warning", msg)
 
     @property
     def safe_temp_c(self):
@@ -127,6 +170,15 @@ class TaskManager:
                 return self.elapsed_base + ((now or self.mono()) - self.segment_start)
             return self.task["elapsed_s"] or 0.0
 
+    def warm_elapsed(self, now=None):
+        """Powered-on warm-up seconds. Only the warm-up timeout uses this."""
+        with self.lock:
+            if self.task is None:
+                return 0.0
+            if self.task["status"] == "warming_up" and self.warm_segment_start is not None:
+                return self.warm_base + ((now or self.mono()) - self.warm_segment_start)
+            return self.task["warmup_elapsed_s"] or 0.0
+
     def machine_status(self):
         with self.lock:
             if self.task is not None:
@@ -146,12 +198,36 @@ class TaskManager:
             live = self.task is not None and t["task_id"] == self.task["task_id"]
             elapsed = self.elapsed() if live else (t["elapsed_s"] or 0.0)
             duration = t["duration_s"]
+            dips, dip_count = self.store.list_excursions(t["task_id"])
+            if t["drying_started_wall"]:
+                warmup_s = t["drying_started_wall"] - (t["started_wall"] or t["drying_started_wall"])
+            elif live and t["status"] == "warming_up" and t["started_wall"]:
+                warmup_s = self.wall() - t["started_wall"]
+            else:
+                warmup_s = None
+            smoothed = self.detector.smoothed if live and self.detector is not None else None
             return {
                 "task_id": t["task_id"],
                 "status": t["status"],
                 "seq": t["seq"],
                 "boot_id": self.boot_id,
+                # session_started: the task was accepted and the heater began warming the chamber
                 "started_at": int(t["started_wall"] * 1000) if t["started_wall"] else None,
+                # drying clock start, backdated to the first sample of the dwell that confirmed the target
+                "drying_started_at": int(t["drying_started_wall"] * 1000) if t["drying_started_wall"] else None,
+                "target_confirmed_at": int(t["target_confirmed_wall"] * 1000) if t["target_confirmed_wall"] else None,
+                "warmup_seconds": round(max(0.0, warmup_s), 1) if warmup_s is not None else None,
+                "mode": t["mode"],
+                "target_temp_c": t["target_c"],
+                "tolerance_c": t["tolerance_c"],
+                "dwell_seconds": t["dwell_s"],
+                "warmup_timeout_seconds": t["warmup_timeout_s"],
+                "smoothed_temp_c": round(smoothed, 1) if smoothed is not None else None,
+                "dips": [{"start": int(d["start_wall"] * 1000),
+                          "end": int(d["end_wall"] * 1000) if d["end_wall"] else None,
+                          "min_temp_c": round(d["min_c"], 1)} for d in dips] or None,
+                "dip_count": dip_count or None,
+                "dip_warning": True if t["dip_warning"] else None,
                 "ended_at": int(t["ended_wall"] * 1000) if t["ended_wall"] else None,
                 "duration_minutes": round(duration / 60.0, 2),
                 "elapsed_seconds": round(elapsed, 1),
@@ -194,6 +270,12 @@ class TaskManager:
                 # rebooted while hot (or blind): cool down before going idle
                 self._begin_cooling(self.mono())
                 return
+            if task["target_c"] is None and task["started_wall"] is not None:
+                # accepted by firmware from before warm-up existed: it was already drying, so keep
+                # that clock and freeze the settings it is running with now
+                task = self.store.update_task(
+                    task["task_id"], drying_started_wall=task["started_wall"], **session_snapshot(self.cfg),
+                    event=("session_backfilled", "task from older firmware, settings frozen at upgrade", None))
             if task["status"] == "recovery_required":
                 self.out.all_off()
                 self.task = task
@@ -217,23 +299,37 @@ class TaskManager:
 
     def shutdown(self):
         with self.lock:
-            if self.task is not None and self.task["status"] == "running":
+            if self.task is not None and self.task["status"] in HEATING_STATUSES:
                 self._checkpoint(self.mono())
             self.out.all_off()
 
     # ---------------- control tick ----------------
     def tick(self):
         with self.lock:
-            now = self.mono()
-            if self.recovery is not None:
-                self._tick_recovery(now)
-            elif self.task is not None and self.task["status"] == "running":
-                self._tick_running(now)
-            elif self.task is not None:  # recovery_required: wait for a person
-                self.out.all_off()
+            try:
+                self._tick(self.mono())
+            except Exception:
+                # whatever went wrong, the relay must not stay on because of it
+                self.out.heater.off()
+                self.store.log_event("controller_error", "control tick raised, heater forced off")
+                raise
 
-            if self.cooling is not None and self.task is None and self.recovery is None:
-                self._tick_cooling(now)
+    def _tick(self, now):
+        task = self.task
+        if self.recovery is not None:
+            self._tick_recovery(now)
+        elif task is not None and task["status"] in HEATING_STATUSES:
+            if not snapshot_valid(task):
+                self._end("failed", "invalid_session", now, {"detail": "session settings missing or invalid"})
+            elif task["status"] == "warming_up":
+                self._tick_warming(now)
+            else:
+                self._tick_running(now)
+        elif task is not None:  # recovery_required: wait for a person
+            self.out.all_off()
+
+        if self.cooling is not None and self.task is None and self.recovery is None:
+            self._tick_cooling(now)
 
     def set_safe_temp(self, value):
         """Apply the cooldown temperature on its own. Invalid values are ignored."""
@@ -279,29 +375,107 @@ class TaskManager:
         self.store.log_event(reason, msg, data={"temp_c": temp, "safe_temp_c": self.safe_temp_c,
                                                 "cooling_s": round(waited, 1)})
 
-    def _tick_running(self, now):
+    def _control_heat(self, now):
+        """Fault checks and the thermostat, shared by warm-up and drying. True while the task goes on.
+
+        Everything here uses the session's frozen settings and the raw reading, so it works
+        without the network and a failed read can never look like a good one.
+        """
+        t = self.task
         temp = self.sensor.temp()
         if temp is None:
-            return self._end("failed", "sensor_failure", now,
-                             {"last_valid_temp_c": self.sensor.temp_c,
-                              "bad_reads": self.sensor.bad_reads})
-        if temp >= self.cfg.TEMP_MAX_C:
-            return self._end("failed", "over_temperature", now,
-                             {"temp_c": temp, "temp_max_c": self.cfg.TEMP_MAX_C})
+            self._end("failed", "sensor_failure", now,
+                      {"last_valid_temp_c": self.sensor.temp_c, "bad_reads": self.sensor.bad_reads})
+            return False
+        if temp >= t["max_temp_c"]:
+            self._end("failed", "over_temperature", now, {"temp_c": temp, "temp_max_c": t["max_temp_c"]})
+            return False
 
         # thermostat, never heat without airflow. The cut-off only pauses heating: the timer,
         # checkpoints and fan carry on, and the fault checks above stay independent of it.
         self.out.fan.on()
         cut = self.cutoff.update(temp, self.heater_cutoff_c)
-        if cut or temp >= self.cfg.TASK_SETPOINT_C:
+        if cut or temp >= t["target_c"]:
             self.out.heater.off()
-        elif temp <= self.cfg.TASK_SETPOINT_C - self.cfg.TASK_HYSTERESIS_C and self.out.fan.is_active:
+        elif temp <= t["target_c"] - t["hysteresis_c"] and self.out.fan.is_active:
             self.out.heater.on()
+        return True
+
+    def _new_detector(self):
+        t = self.task
+        self.detector = warmup.TargetDetector(t["target_c"], t["tolerance_c"], t["dwell_s"],
+                                              t["median_window"], self.cfg.DWELL_MAX_GAP_SECONDS)
+        self._seen_reads = self.sensor.reads
+
+    def _sample(self, phase):
+        """Feed a new valid reading, if there is one, to the detector and the temperature log."""
+        s = self.sensor
+        if s.reads == self._seen_reads or s.temp_c is None:
+            return None
+        self._seen_reads = s.reads
+        mono = s.temp_time
+        wall = self.wall() - (self.mono() - mono)  # when it was read, not when this tick ran
+        res = self.detector.feed(mono, wall, s.temp_c)
+        self._log_buf.append((self.task["task_id"], wall, mono, s.temp_c, res.smoothed, phase))
+        return res, wall
+
+    def _flush_log(self):
+        buf, self._log_buf = self._log_buf, []
+        self.store.append_temp_samples(buf)
+
+    def _tick_warming(self, now):
+        if not self._control_heat(now):
+            return
+        t = self.task
+        got = self._sample("warming_up")
+        if got is not None and got[0].confirmed:
+            return self._start_drying(got[0], now)
+        if self.warm_elapsed(now) >= t["warmup_timeout_s"]:
+            return self._end("failed", "warmup_timeout", now,
+                             {"temp_c": self.sensor.temp_c, "target_c": t["target_c"],
+                              "warmup_s": round(self.warm_elapsed(now), 1)})
+        if now - self.last_checkpoint >= self.cfg.CHECKPOINT_SECONDS:
+            self._checkpoint(now)
+
+    def _start_drying(self, res, now):
+        """The target held for the whole dwell: the drying clock starts at its first sample."""
+        wall = self.wall()
+        base = max(0.0, now - res.first_mono)
+        self._begin_running(
+            base, now,
+            ("target_reached", "target temperature confirmed, drying started",
+             {"temp_c": self.sensor.temp_c, "smoothed_c": round(res.smoothed, 2),
+              "drying_started_wall": res.first_wall, "dwell_s": self.task["dwell_s"]}),
+            drying_started_wall=res.first_wall, target_confirmed_wall=wall,
+            warmup_elapsed_s=self.warm_elapsed(now))
+
+    def _tick_running(self, now):
+        if not self._control_heat(now):
+            return
+        got = self._sample("drying")
+        if got is not None and got[0].full:
+            self._track_dips(got[0].smoothed, got[1])
 
         if self.elapsed(now) >= self.task["duration_s"]:
             self._end("completed", None, now)
         elif now - self.last_checkpoint >= self.cfg.CHECKPOINT_SECONDS:
             self._checkpoint(now)
+
+    def _track_dips(self, smoothed, wall):
+        """Log excursions below the band. The timer keeps running; only a long dip raises a flag."""
+        t = self.task
+        kind, start, end, min_c, warn = self.dips.feed(wall, smoothed)
+        if kind:
+            self.store.save_excursion(t["task_id"], start, end, min_c)
+            msg = ("temperature dropped below the drying band" if kind == "opened"
+                   else "temperature back in the drying band")
+            self.store.log_event(f"dip_{kind}", msg, t["task_id"],
+                                 {"start_wall": start, "end_wall": end, "min_temp_c": round(min_c, 2)})
+        if warn and not t["dip_warning"]:
+            self.task = self.store.update_task(
+                t["task_id"], dip_warning=1,
+                event=("dip_warning", "temperature stayed below the drying band too long, drying continues",
+                       {"limit_s": t["dip_limit_s"], "min_temp_c": round(min_c, 2)}))
 
     def _tick_recovery(self, now):
         r = self.recovery
@@ -319,6 +493,8 @@ class TaskManager:
             return
 
         task = self.task
+        if task["drying_started_wall"] is None:
+            return self._recover_warming(task, r, now)
         # compare against the earliest readings: the heater is off while we observe,
         # so later readings partly measure the cooling caused by this check itself
         gap = recovery.interruption_gap(task, self.boot_id, now, self.wall(), synced)
@@ -342,6 +518,28 @@ class TaskManager:
                 diagnostics=d.diagnostics,
                 event=("recovery_required", f"inspection needed: {d.reason}", d.diagnostics))
 
+    def _recover_warming(self, task, r, now):
+        """A restart during warm-up loses no drying time, so only the sensor and the hard limit decide.
+
+        Warm-up always resumes as warm-up: the dwell starts over (the target is never taken as
+        reached from before the restart) and the warm-up timeout keeps counting from its checkpoint.
+        """
+        self.recovery = None
+        readings = r["readings"]
+        current = median(readings) if self.sensor.ok() and len(readings) >= self.cfg.RECOVERY_MIN_READS else None
+        diag = {"current_temp_c": round(current, 2) if current is not None else None,
+                "readings": len(readings), "boot_changed": r["boot_changed"],
+                "clean_shutdown": r["clean_shutdown"], "clock_synced": self.clock_synced(),
+                "warmup_elapsed_s": round(task["warmup_elapsed_s"] or 0.0, 1)}
+        if not snapshot_valid(task):
+            return self._end("failed", "invalid_session", now, diag)
+        if current is None:
+            return self._end("failed", "sensor_unavailable", now, diag)
+        if current >= task["max_temp_c"]:
+            return self._end("failed", "over_temperature", now, dict(diag, temp_c=current))
+        self._begin_warming(task["warmup_elapsed_s"] or 0.0, now,
+                            ("task_resumed", "warm-up resumed after a restart, target not yet confirmed", diag))
+
     # ---------------- transitions ----------------
     def _checkpoint_fields(self, now, elapsed):
         fields = {
@@ -359,24 +557,57 @@ class TaskManager:
 
     def _checkpoint(self, now):
         self.last_checkpoint = now
+        fields = self._checkpoint_fields(now, self.elapsed(now))
+        if self.task["status"] == "warming_up":
+            fields["warmup_elapsed_s"] = self.warm_elapsed(now)
+        self._flush_log()
+        if self.dips is not None and self.dips.open:
+            self.store.save_excursion(self.task["task_id"], self.dips.start, None, self.dips.min_c)
+        self.task = self.store.update_task(self.task["task_id"], **fields)
+
+    def _begin_warming(self, warm_base, now, event, **extra):
+        self.warm_base = warm_base
+        self.warm_segment_start = now
+        self.segment_start = None
+        self.dips = None
+        self.last_checkpoint = now
+        self.cooling = None
+        # persisted as warming_up before the thermostat may switch the heater on
         self.task = self.store.update_task(
-            self.task["task_id"], **self._checkpoint_fields(now, self.elapsed(now)))
+            self.task["task_id"], status="warming_up", failure_reason=None, event=event,
+            **self._checkpoint_fields(now, self.task["elapsed_s"] or 0.0),
+            warmup_elapsed_s=warm_base, **extra)
+        self._new_detector()
 
     def _begin_running(self, elapsed_base, now, event, **extra):
         self.elapsed_base = elapsed_base
         self.segment_start = now
+        self.warm_segment_start = None
         self.last_checkpoint = now
         self.cooling = None
         # persisted as running before the thermostat may switch the heater on
         self.task = self.store.update_task(
             self.task["task_id"], status="running", failure_reason=None, event=event,
             **self._checkpoint_fields(now, elapsed_base), **extra)
+        self._new_detector()
+        self.dips = warmup.DipTracker(self.task["target_c"] - self.task["tolerance_c"],
+                                      self.task["dip_limit_s"])
+        open_dip = self.store.open_excursion(self.task["task_id"])
+        if open_dip:  # restarted while below the band: the same excursion goes on
+            self.dips.restore(open_dip["start_wall"], open_dip["min_c"])
 
     def _end(self, status, reason, now, diagnostics=None, reason_in_event=None):
         self.out.heater.off()
         elapsed = self.elapsed(now)
         self.segment_start = None
         fields = self._checkpoint_fields(now, elapsed)
+        if self.task["status"] == "warming_up":
+            fields["warmup_elapsed_s"] = self.warm_elapsed(now)
+        self.warm_segment_start = None
+        self._flush_log()
+        if self.dips is not None and self.dips.open:
+            self.store.save_excursion(self.task["task_id"], self.dips.start, self.wall(), self.dips.min_c)
+        self.detector = self.dips = None
         msg = {
             "completed": "drying task completed",
             "failed": f"task failed: {reason}",
@@ -444,6 +675,9 @@ class TaskManager:
             raise Rejected("task_id_already_used", "duplicate")
 
         w, count, dur = (cmd.get(k) for k in ("weight_kg", "batch_count", "duration_minutes"))
+        mode = cmd.get("mode")
+        if mode is not None and mode not in MODES:
+            raise Rejected("invalid_mode")  # recorded for audit only, it does not change how the task runs
         rows = parse_row_levels(cmd.get("row_levels"), cfg.ALLOWED_ROW_LEVELS)
         if w is not None and not (_number(w) and 0 < w <= cfg.MAX_WEIGHT_KG):
             raise Rejected("invalid_weight")  # optional, the web app may not send it
@@ -468,19 +702,23 @@ class TaskManager:
         if temp >= cfg.TEMP_MAX_C - cfg.TEMP_RESUME_DROP:
             raise Rejected("too_hot")
 
+        snap = session_snapshot(cfg)
         try:
             self.task = self.store.create_task(
                 task_id, float(w) if w is not None else None, int(count), rows, float(dur) * 60.0,
+                mode=mode, snapshot=snap,
                 event=("task_accepted", "drying task accepted",
                        {"command_id": cmd["command_id"], "weight_kg": w, "batch_count": count,
-                        "row_levels": rows, "duration_minutes": dur, "temp_c": temp,
-                        "requested_by": cmd.get("requested_by")}))
+                        "row_levels": rows, "duration_minutes": dur, "temp_c": temp, "mode": mode,
+                        "requested_by": cmd.get("requested_by"), **snap}))
         except sqlite3.IntegrityError:
             raise Rejected("task_id_already_used", "duplicate")
         if self.on_task_start:
             self.on_task_start()
         now = self.mono()
-        self._begin_running(0.0, now, ("task_running", "drying started", {"temp_c": temp}),
+        # the drying clock does not run yet: the chamber has to reach and hold the target first
+        self._begin_warming(0.0, now, ("task_warming_up", "warming up, drying starts once the target holds",
+                                       {"temp_c": temp, "target_c": snap["target_c"]}),
                             started_wall=self.wall())
 
     def _cmd_add_batch(self, cmd, task_id):
@@ -581,7 +819,7 @@ class TaskManager:
             raise Rejected(f"not_allowed_while_{self.task['status']}")
 
     def _cmd_cancel(self, cmd, task_id):
-        self._require_task(task_id, ("starting", "running", "recovering", "recovery_required"))
+        self._require_task(task_id, ("starting", "warming_up", "running", "recovering", "recovery_required"))
         self.recovery = None
         self._end("cancelled", "cancelled_by_user", self.mono())
 

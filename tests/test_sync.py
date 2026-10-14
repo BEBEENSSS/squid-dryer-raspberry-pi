@@ -40,10 +40,13 @@ def test_command_ack_and_state_published(rig):
     ack = base.data["task"]["ack"]
     assert ack["command"] == "start" and ack["task_id"] == "T1" and ack["result"] == "accepted"
     rep = base.data["task"]["report"]
-    assert rep["status"] == "running" and rep["row_levels"] == "1,2" and rep["batch_count"] == 10
-    assert 0 < rep["progress_percent"] < 100 and rep["duration_minutes"] == 5
+    # a fresh task warms up first: the drying clock has not started
+    assert rep["status"] == "warming_up" and rep["row_levels"] == "1,2" and rep["batch_count"] == 10
+    assert rep["progress_percent"] == 0 and rep["duration_minutes"] == 5
+    assert rep["started_at"] and rep.get("drying_started_at") is None  # (Firebase drops null fields)
+    assert rep["target_temp_c"] == config.TASK_SETPOINT_C
     assert rep["reported_at"] == {".sv": "timestamp"}
-    assert st["status"] == "running" and st["ready"] is False
+    assert st["status"] == "warming_up" and st["ready"] is False
     assert "online" not in st and st["last_seen"] == {".sv": "timestamp"}
     assert set(base.data["events"]) == {"0000000001", "0000000002"}
     # same command still sitting in Firebase is not re-delivered

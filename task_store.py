@@ -7,7 +7,27 @@ import time
 from pathlib import Path
 
 # statuses that mean a task still owns the machine
-ACTIVE_STATUSES = ("starting", "running", "recovering", "recovery_required")
+ACTIVE_STATUSES = ("starting", "warming_up", "running", "recovering", "recovery_required")
+
+# Columns added after the first release, applied to existing databases on open. The *_c / *_s
+# snapshot columns are copied from config when a task starts and never change afterwards.
+TASK_MIGRATIONS = {
+    "drying_started_wall": "REAL",      # backdated to the first sample of the qualifying dwell
+    "target_confirmed_wall": "REAL",    # when the dwell finished
+    "warmup_elapsed_s": "REAL NOT NULL DEFAULT 0",  # powered-on warm-up time, for the timeout
+    "dip_warning": "INTEGER NOT NULL DEFAULT 0",
+    "mode": "TEXT",
+    "target_c": "REAL",
+    "tolerance_c": "REAL",
+    "hysteresis_c": "REAL",
+    "dwell_s": "REAL",
+    "median_window": "INTEGER",
+    "warmup_timeout_s": "REAL",
+    "dip_limit_s": "REAL",
+    "max_temp_c": "REAL",
+}
+SNAPSHOT_FIELDS = ("target_c", "tolerance_c", "hysteresis_c", "dwell_s", "median_window",
+                   "warmup_timeout_s", "dip_limit_s", "max_temp_c")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -66,6 +86,33 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+CREATE TABLE IF NOT EXISTS temp_log (
+    task_id TEXT NOT NULL,
+    wall REAL NOT NULL,
+    mono REAL NOT NULL,
+    raw_c REAL NOT NULL,
+    smoothed_c REAL NOT NULL,
+    phase TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS temp_log_task ON temp_log (task_id, wall);
+CREATE TABLE IF NOT EXISTS temp_minutes (
+    task_id TEXT NOT NULL,
+    minute INTEGER NOT NULL,
+    n INTEGER NOT NULL,
+    sum_c REAL NOT NULL,
+    min_c REAL NOT NULL,
+    max_c REAL NOT NULL,
+    raw_last REAL NOT NULL,
+    uploaded INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (task_id, minute)
+);
+CREATE TABLE IF NOT EXISTS task_excursions (
+    task_id TEXT NOT NULL,
+    start_wall REAL NOT NULL,
+    end_wall REAL,
+    min_c REAL NOT NULL,
+    PRIMARY KEY (task_id, start_wall)
+);
 """
 
 
@@ -94,6 +141,9 @@ class TaskStore:
             cols = [r["name"] for r in c.execute("PRAGMA table_info(tasks)")]
             if "completed_rows" not in cols:
                 c.execute("ALTER TABLE tasks ADD COLUMN completed_rows TEXT NOT NULL DEFAULT ''")
+            for name, sql_type in TASK_MIGRATIONS.items():
+                if name not in cols:
+                    c.execute(f"ALTER TABLE tasks ADD COLUMN {name} {sql_type}")
 
     # ---------------- connection ----------------
     def _conn(self):
@@ -158,13 +208,20 @@ class TaskStore:
             c.executemany("UPDATE events SET uploaded=1 WHERE id=?", [(i,) for i in ids])
 
     # ---------------- tasks ----------------
-    def create_task(self, task_id, weight_kg, batch_count, row_levels, duration_s, event=None):
-        """Insert a new task as 'starting'. Raises sqlite3.IntegrityError on a duplicate id."""
+    def create_task(self, task_id, weight_kg, batch_count, row_levels, duration_s, event=None,
+                    mode=None, snapshot=None):
+        """Insert a new task as 'starting'. Raises sqlite3.IntegrityError on a duplicate id.
+
+        `snapshot` holds the SNAPSHOT_FIELDS values the session runs with from now on.
+        """
+        snapshot = snapshot or {}
         with self._conn() as c:
             c.execute(
                 "INSERT INTO tasks(task_id, weight_kg, batch_count, row_levels, duration_s, status, "
-                "accepted_wall, seq) VALUES(?, ?, ?, ?, ?, 'starting', ?, 1)",
-                (task_id, weight_kg, batch_count, row_levels, duration_s, self._wall()),
+                "accepted_wall, seq, mode, " + ", ".join(SNAPSHOT_FIELDS) + ") "
+                "VALUES(?, ?, ?, ?, ?, 'starting', ?, 1, ?" + ", ?" * len(SNAPSHOT_FIELDS) + ")",
+                (task_id, weight_kg, batch_count, row_levels, duration_s, self._wall(), mode,
+                 *(snapshot.get(k) for k in SNAPSHOT_FIELDS)),
             )
             if event:
                 self._insert_event(c, *event[:2], task_id=task_id, data=event[2] if len(event) > 2 else None)
@@ -231,6 +288,61 @@ class TaskStore:
     def latest_task(self):
         return _row(self._conn().execute(
             "SELECT * FROM tasks ORDER BY accepted_wall DESC, rowid DESC LIMIT 1").fetchone())
+
+    # ---------------- temperature log ----------------
+    def append_temp_samples(self, rows):
+        """rows: (task_id, wall, mono, raw_c, smoothed_c, phase). Also folds them into minute summaries."""
+        if not rows:
+            return
+        with self._conn() as c:
+            c.executemany(
+                "INSERT INTO temp_log(task_id, wall, mono, raw_c, smoothed_c, phase) VALUES(?, ?, ?, ?, ?, ?)",
+                rows)
+            c.executemany(
+                "INSERT INTO temp_minutes(task_id, minute, n, sum_c, min_c, max_c, raw_last, uploaded) "
+                "VALUES(?, ?, 1, ?, ?, ?, ?, 0) "
+                "ON CONFLICT(task_id, minute) DO UPDATE SET n=n+1, sum_c=sum_c+excluded.sum_c, "
+                "min_c=min(min_c, excluded.min_c), max_c=max(max_c, excluded.max_c), "
+                "raw_last=excluded.raw_last, uploaded=0",
+                [(t, int(w // 60), s, s, s, raw) for t, w, _m, raw, s, _p in rows])
+
+    def temp_log(self, task_id):
+        return [dict(r) for r in self._conn().execute(
+            "SELECT * FROM temp_log WHERE task_id=? ORDER BY wall, rowid", (task_id,))]
+
+    def pending_temp_minutes(self, limit=100):
+        return [dict(r) for r in self._conn().execute(
+            "SELECT * FROM temp_minutes WHERE uploaded=0 ORDER BY task_id, minute LIMIT ?", (limit,))]
+
+    def mark_temp_minutes_uploaded(self, items):
+        """items: (task_id, minute, n). A minute that gained samples meanwhile stays pending."""
+        if not items:
+            return
+        with self._conn() as c:
+            c.executemany("UPDATE temp_minutes SET uploaded=1 WHERE task_id=? AND minute=? AND n=?", items)
+
+    # ---------------- temperature excursions ----------------
+    def save_excursion(self, task_id, start_wall, end_wall, min_c):
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO task_excursions(task_id, start_wall, end_wall, min_c) VALUES(?, ?, ?, ?) "
+                "ON CONFLICT(task_id, start_wall) DO UPDATE SET end_wall=excluded.end_wall, min_c=excluded.min_c",
+                (task_id, start_wall, end_wall, min_c))
+
+    def open_excursion(self, task_id):
+        r = self._conn().execute(
+            "SELECT * FROM task_excursions WHERE task_id=? AND end_wall IS NULL "
+            "ORDER BY start_wall DESC LIMIT 1", (task_id,)).fetchone()
+        return dict(r) if r else None
+
+    def list_excursions(self, task_id, limit=20):
+        """The most recent excursions, oldest first, plus the total count."""
+        rows = self._conn().execute(
+            "SELECT * FROM task_excursions WHERE task_id=? ORDER BY start_wall DESC LIMIT ?",
+            (task_id, limit)).fetchall()
+        total = self._conn().execute(
+            "SELECT COUNT(*) FROM task_excursions WHERE task_id=?", (task_id,)).fetchone()[0]
+        return [dict(r) for r in reversed(rows)], total
 
     # ---------------- commands ----------------
     def seen_command(self, command_id):

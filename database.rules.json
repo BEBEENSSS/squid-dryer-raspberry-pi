@@ -32,6 +32,7 @@
             "row_levels": { ".validate": "newData.isString() && newData.val().length <= 64 && newData.val().matches(/^[0-9]+( *, *[0-9]+)*$/)" },
             "batch_id": { ".validate": "newData.isString() && newData.val().matches(/^[A-Za-z0-9_-]{1,64}$/)" },
             "weight_kg": { ".validate": "newData.isNumber() && newData.val() > 0" },
+            "mode": { ".validate": "newData.isString() && newData.val().matches(/^(standard|experiment)$/)" },
             "requested_by": { ".validate": "newData.isString() && newData.val().length <= 128" },
             "$other": { ".validate": false }
           }
