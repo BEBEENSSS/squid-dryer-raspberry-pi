@@ -10,7 +10,7 @@ The Pi is the authority on what the machine is actually doing. Firebase is used 
 | `task_manager.py` | Drying task state machine, timer, thermostat, safety faults |
 | `recovery.py` | Decision after a restart: resume / failed / recovery required |
 | `task_store.py` | SQLite record (`data/dryer.db`): tasks, event outbox, processed commands |
-| `cloud_sync.py` | Background Firebase thread: command polling, heartbeat, event upload |
+| `cloud_sync.py` | Background Firebase thread: command stream + polling, heartbeat, event upload |
 | `hardware.py` | Relays and sensor reading (unchanged logic) |
 | `config.py` | All tunable values |
 
@@ -134,6 +134,8 @@ The schema follows the web app. Security rules are in `database.rules.json`. The
 - `state/fan`, `heater`, `temp`, `sensor_ok`, `temp_max`, `last_event`, `boot_id`, `pending_events` (events still waiting to upload)
 - `state/last_seen`: server timestamp of the last successful write.
 - `events/{0000000001…}`: the local event log in order. Events recorded offline are uploaded after reconnection, and their `at` is the Pi's local time.
+
+**Manual control latency:** a Firebase stream on `commands` and `task/request` wakes the sync thread the moment the web app writes, and the 2 s poll (`SYNC_INTERVAL`) is the backup if the stream is down (`COMMAND_LISTEN`). The control loop applies the newest manual request at once and publishes `state` as soon as fan, heater or status change, instead of waiting for the 5 s timer. The temperature sensor is read on its own thread so a slow read never delays a command. The Pi only ever resets `commands/*` to `false`, so racing an operator write can't switch equipment on. The web app still treats `state` as the only proof of what the hardware did.
 
 **Online/offline:** while connected the Pi writes about every 5 s. There's no "online" flag, because the Pi can't report that it has lost its connection. Treat the machine as offline when `serverNow − last_seen > 90 s`, with `serverNow = Date.now() + .info/serverTimeOffset`. After it comes back:
 - If `boot_id` changed and there's a `device_started` event, the machine restarted.

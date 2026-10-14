@@ -52,7 +52,9 @@ TEMP_DROP_FAIL_C = 8.0          # drop at or above this -> failed (possible powe
 RESUME_MAX_GAP_SECONDS = 300    # longer interruptions are never auto-resumed
 
 # ---------------- cloud sync ----------------
-SYNC_INTERVAL = 2               # seconds between command polls
+SYNC_INTERVAL = 2               # seconds between command polls (backup when the stream is down)
+SETTINGS_POLL_SECONDS = 10      # settings change rarely, so they are not read on every poll
+COMMAND_LISTEN = True           # stream commands/task request changes to wake the sync at once
 HEARTBEAT_SECONDS = 30          # max time between state writes while online
 TEMP_PUBLISH_SECONDS = 5        # how often temp is sent to Firebase
 SYNC_BACKOFF_MAX = 30           # retry delay cap while offline

@@ -25,6 +25,19 @@ def clock_synced():
     return TIMESYNC_FLAG.exists()
 
 
+def coalesce_commands(items):
+    """Keep task and settings commands in order, but only the latest manual request.
+
+    Manual requests are a wanted state, not events, so applying every intermediate one
+    would only flap the relays.
+    """
+    last_manual = None
+    for i, (kind, _) in enumerate(items):
+        if kind == "manual":
+            last_manual = i
+    return [item for i, item in enumerate(items) if item[0] != "manual" or i == last_manual]
+
+
 class ManualControl:
     """The original commands/fan + commands/heater behaviour, used when no task is active."""
 
@@ -177,28 +190,37 @@ def main():
 
     # get a first reading before the recovery check starts
     sensor.poll()
-    last_read = time.monotonic()
     store.log_event("device_started", "device started", data={
         "boot_changed": prev_boot != boot_id, "previous_boot_id": prev_boot,
         "clean_shutdown": clean, "clock_synced": clock_synced(),
     })
     tm.startup(prev_boot, clean)
 
+    def read_sensor():
+        # the 1-Wire read takes about a second, so it must not hold up command handling
+        while not stop.wait(config.SENSOR_INTERVAL):
+            sensor.poll()
+
+    threading.Thread(target=read_sensor, daemon=True, name="sensor").start()
     threading.Thread(target=sync.run, args=(stop,), daemon=True, name="cloud-sync").start()
     print("Running. Control it from Firebase.")
 
     try:
-        while not stop.wait(config.LOOP_INTERVAL):
-            now = time.monotonic()
-            if now - last_read >= config.SENSOR_INTERVAL:
-                sensor.poll()
-                last_read = now
-
+        next_tick = time.monotonic()
+        last_published = None
+        while not stop.is_set():
+            # wake as soon as a command arrives instead of sleeping out the tick
+            try:
+                items = [commands.get(timeout=max(0.0, next_tick - time.monotonic()))]
+            except queue.Empty:
+                items = []
             while True:
                 try:
-                    kind, payload = commands.get_nowait()
+                    items.append(commands.get_nowait())
                 except queue.Empty:
                     break
+
+            for kind, payload in coalesce_commands(items):
                 if kind == "task":
                     ack = tm.handle_command(payload)
                     if ack:
@@ -208,8 +230,17 @@ def main():
                 else:
                     manual.apply(*payload)
 
-            tm.tick()
-            manual.tick()
+            now = time.monotonic()
+            if now >= next_tick:
+                tm.tick()
+                manual.tick()
+                next_tick = now + config.LOOP_INTERVAL
+
+            # report a confirmed change at once (commands, thermostat, cooling end, failsafe)
+            confirmed = (out.fan.is_active, out.heater.is_active, tm.machine_status())
+            if items or confirmed != last_published:
+                last_published = confirmed
+                sync.notify()
     finally:
         out.all_off()
         tm.shutdown()
