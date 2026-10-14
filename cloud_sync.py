@@ -40,6 +40,7 @@ class CloudSync:
         self._pending_writes = {}           # e.g. {"commands/heater": False}
         self._last_task_cmd = None
         self._last_manual = None
+        self._last_safe_temp = None
         self._last_publish = None
         self._offline_since = None
 
@@ -88,6 +89,13 @@ class CloudSync:
         if key is not None and key != self._last_task_cmd:
             self._last_task_cmd = key
             self.commands.put(("task", request))
+
+        settings = self._base.child("settings").get()
+        if isinstance(settings, dict) and "safe_temp_c" in settings:
+            safe = settings["safe_temp_c"]
+            if safe != self._last_safe_temp:
+                self._last_safe_temp = safe
+                self.commands.put(("settings", safe))
 
         cmds = self._base.child("commands").get() or {}
         if not isinstance(cmds, dict):

@@ -148,3 +148,42 @@ def test_manual_failsafe_still_works_without_task(rig):
     sync.sync_once()
     manual.tick()
     assert not rig.out.heater.is_active
+
+
+def test_safe_temp_setting_is_polled_once(rig):
+    from tests.conftest import FakeBase
+    base = FakeBase()
+    sync, q = make_sync(rig, base)
+
+    def settings_items():
+        items = []
+        while not q.empty():
+            kind, payload = q.get_nowait()
+            if kind == "settings":
+                items.append(payload)
+        return items
+
+    base.data = {"settings": {"safe_temp_c": 33}}
+    assert sync.sync_once()
+    assert settings_items() == [33]
+    assert sync.sync_once()
+    assert settings_items() == []  # unchanged value is not re-delivered
+    base.data["settings"]["safe_temp_c"] = 36
+    assert sync.sync_once()
+    assert settings_items() == [36]
+
+
+def test_manual_commands_ignored_while_cooling(rig):
+    from tests.conftest import FakeBase
+    base = FakeBase()
+    sync, q = make_sync(rig, base)
+    manual = ManualControl(rig.out, rig.sensor, rig.store, sync, rig.tm, mono=lambda: rig.clock.mono)
+    rig.start(row_levels="1", duration_min=60)
+    rig.run(300)
+    rig.cmd("complete_batch", "T1", row_levels="1")
+    assert rig.tm.cooling_active()
+    manual.apply(False, False)  # a stale "fan off" must not cut cooling short
+    assert rig.out.fan.is_active
+    manual.apply(True, True)
+    assert not rig.out.heater.is_active and rig.out.fan.is_active
+    assert sync._pending_writes == {"commands/heater": False, "commands/fan": False}

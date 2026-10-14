@@ -19,7 +19,7 @@ Run the tests with `.venv/bin/python -m pytest` (the relays are mocked, so no ha
 ## Task lifecycle
 
 ```
-ready ──start──▶ starting ──▶ running ──▶ completed
+ready ──start──▶ starting ──▶ running ──▶ completed ──▶ cooling ──(temp ≤ safe)──▶ ready
                                │  │
                                │  └─ sensor fault / over-temp ─▶ failed ──acknowledge──▶ ready
                                └─ stop ─▶ cancelled
@@ -33,7 +33,9 @@ restart while active ─▶ recovering ─┬─▶ running            (auto-res
 - The task row is committed to SQLite as `starting` and then `running` **before** the heater can switch on.
 - **Timer:** only time actually spent running counts. Elapsed time comes from the monotonic clock and is saved every `CHECKPOINT_SECONDS`. After a restart the timer continues from the last saved value. It never restarts from zero, and downtime is never counted as drying time. At worst, one checkpoint interval (10 s) of drying gets repeated.
 - **Thermostat during a task:** heater on at ≤ `TASK_SETPOINT_C − TASK_HYSTERESIS_C`, off at ≥ `TASK_SETPOINT_C`, fan always on. `TEMP_MAX_C` stays the hard cutoff.
-- **Losing the internet never fails a task.** A sensor failure (3 bad reads or 10 s without a valid reading) or reaching `TEMP_MAX_C` turns the heater off and marks the task `failed`. The fan then runs for `FAN_COOLDOWN_SECONDS`.
+- **Losing the internet never fails a task.** A sensor failure (3 bad reads or 10 s without a valid reading) or reaching `TEMP_MAX_C` turns the heater off and marks the task `failed`. The machine then cools (below).
+- **Confirming a batch dry (`complete_batch`):** frees one row. The other rows keep drying and the schedule is unchanged. When the last row is freed the task ends `completed`.
+- **Cooling:** whenever a task ends (completed, cancelled, failed) the heater turns off immediately and the fan keeps running while the measured temperature is above the safe shutdown temperature. Once it is at or below, the fan turns off and the status goes back to `ready`. The safe temperature comes from `settings/safe_temp_c` (25–50 °C), is saved in the local database and survives reboots and outages; the default is `COOLDOWN_SAFE_TEMP_C`. Cooling stops after `COOLDOWN_MAX_SECONDS`, or `COOLDOWN_NO_SENSOR_SECONDS` if the sensor is dead. A reboot while hot also starts cooling. A new task can start during cooling once it is below the `too_hot` limit, and manual fan/heater commands are ignored (and reset) while cooling. Everything runs locally, with no internet needed.
 - A `failed` task blocks new starts until the web app sends `acknowledge`. Nothing ever restarts heating on its own after a failure.
 - **Manual mode** (`commands/fan`, `commands/heater`) works as before, including the 600 s auto-off and the 120 s offline failsafe. It is ignored while a task is active or waiting for recovery.
 
@@ -78,14 +80,16 @@ The rules are checked in this order:
 | `RECOVERY_CLOCK_WAIT_SECONDS` | 120 | maximum wait for NTP after a reboot |
 | `RESUME_MAX_GAP_SECONDS` | 300 | longer interruptions are never resumed automatically |
 | `CHECKPOINT_SECONDS` | 10 | how often progress is saved |
-| `FAN_COOLDOWN_SECONDS` | 120 | fan run-on after a task ends |
+| `COOLDOWN_SAFE_TEMP_C` | 40 | default safe shutdown temperature; the web app can change it (`settings/safe_temp_c`, 25–50) |
+| `COOLDOWN_MAX_SECONDS` | 3600 | cooling is cut off after this long |
+| `COOLDOWN_NO_SENSOR_SECONDS` | 600 | fan run time if the sensor is dead while cooling |
 | `COMMAND_MAX_AGE_SECONDS` | 600 | older commands are rejected as `stale_command` (only checked when the clock is synced) |
 | `MAX_BATCH_COUNT`, `MIN/MAX_DURATION_MIN` | 100, 1–10080 | start validation, same limits as `database.rules.json` |
 | `ALLOWED_ROW_LEVELS`, `MAX_WEIGHT_KG` | 1–4, 20 | **placeholders, set them for the machine**. Weight is only checked when sent |
 
 ## Firebase schema (`devices/squid-dryer/...`)
 
-The schema follows the web app. Security rules are in `database.rules.json`. The Pi uses the Admin SDK, which ignores rules, so the rules only limit what the web app can do: it may write `commands` and `task/request`, and nothing else.
+The schema follows the web app. Security rules are in `database.rules.json`. The Pi uses the Admin SDK, which ignores rules, so the rules only limit what the web app can do: it may write `commands`, `settings` and `task/request`, and nothing else. `settings/safe_temp_c` is the safe shutdown temperature; the machine reports the value it applies in `state/safe_temp`, and `state/cooling` / `state.status = "cooling"` while cooling.
 
 **The web app writes** `task/request`, replacing it with each new request:
 
@@ -105,6 +109,7 @@ The schema follows the web app. Security rules are in `database.rules.json`. The
 - `command` is one of these:
   - `start`
   - `add_batch` (adds one batch to the running task, see below)
+  - `complete_batch` (`row_levels` = one row: the operator confirmed that batch dry. Frees the row; the last row ends the task and starts cooling. The report lists freed rows in `completed_rows`)
   - `cancel` (a running task, or one waiting for recovery)
   - `resume` (only from `recovery_required`)
   - `abort` (gives up a task in `recovery_required`)

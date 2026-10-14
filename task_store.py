@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     diagnostics_json TEXT,
     ended_wall REAL,
     acknowledged INTEGER NOT NULL DEFAULT 0,
-    seq INTEGER NOT NULL DEFAULT 0
+    seq INTEGER NOT NULL DEFAULT 0,
+    completed_rows TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS task_batches (
     task_id TEXT NOT NULL,
@@ -89,6 +90,10 @@ class TaskStore:
         self._local = threading.local()
         with self._conn() as c:
             c.executescript(SCHEMA)
+            # databases created before completed_rows existed
+            cols = [r["name"] for r in c.execute("PRAGMA table_info(tasks)")]
+            if "completed_rows" not in cols:
+                c.execute("ALTER TABLE tasks ADD COLUMN completed_rows TEXT NOT NULL DEFAULT ''")
 
     # ---------------- connection ----------------
     def _conn(self):
@@ -180,7 +185,7 @@ class TaskStore:
         return self.get_task(task_id)
 
     def add_batch(self, task_id, batch_id, row_level, weight_kg, duration_s, offset_s,
-                  task_duration_s, row_levels, batch_count, event=None):
+                  task_duration_s, row_levels, batch_count, event=None, completed_rows=None):
         """Record a batch added to a running task and extend the task, in one transaction."""
         with self._conn() as c:
             c.execute(
@@ -192,6 +197,8 @@ class TaskStore:
                 "UPDATE tasks SET duration_s=?, row_levels=?, batch_count=?, seq=seq+1 WHERE task_id=?",
                 (task_duration_s, row_levels, batch_count, task_id),
             )
+            if completed_rows is not None:
+                c.execute("UPDATE tasks SET completed_rows=? WHERE task_id=?", (completed_rows, task_id))
             if event:
                 self._insert_event(c, *event[:2], task_id=task_id, data=event[2] if len(event) > 2 else None)
         return self.get_task(task_id)

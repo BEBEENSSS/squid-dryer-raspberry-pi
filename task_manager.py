@@ -95,13 +95,30 @@ class TaskManager:
         self.elapsed_base = 0.0     # running time accumulated before this segment
         self.last_checkpoint = 0.0
         self.recovery = None        # observation state while deciding after a restart
-        self.cooldown_until = None
+        self.cooling = None         # {"start": monotonic} while the fan runs the machine down
+        self.safe_temp_c = self._load_safe_temp()
         self.initialized = False
+
+    def _load_safe_temp(self):
+        saved = self.store.get_meta("safe_temp_c")
+        try:
+            value = float(saved)
+        except (TypeError, ValueError):
+            return self.cfg.COOLDOWN_SAFE_TEMP_C
+        return value if self._safe_temp_ok(value) else self.cfg.COOLDOWN_SAFE_TEMP_C
+
+    def _safe_temp_ok(self, value):
+        return (_number(value)
+                and self.cfg.COOLDOWN_SAFE_TEMP_MIN_C <= value <= self.cfg.COOLDOWN_SAFE_TEMP_MAX_C)
 
     # ---------------- queries ----------------
     def busy(self):
         with self.lock:
             return self.task is not None or self.recovery is not None
+
+    def cooling_active(self):
+        with self.lock:
+            return self.cooling is not None and self.task is None
 
     def elapsed(self, now=None):
         with self.lock:
@@ -117,6 +134,8 @@ class TaskManager:
                 return self.task["status"]
             if self.store.unacknowledged_failure():
                 return "failed"
+            if self.cooling is not None:
+                return "cooling"
             return "ready" if self.initialized else "starting"
 
     def snapshot(self):
@@ -142,6 +161,7 @@ class TaskManager:
                 "batch_count": t["batch_count"],
                 "row_levels": t["row_levels"],
                 "weight_kg": t["weight_kg"],
+                "completed_rows": t["completed_rows"] or None,  # None removes the key
                 "reason": t["failure_reason"],
                 "detail": _detail(t["diagnostics"]),
                 "acknowledged": bool(t["acknowledged"]),
@@ -172,6 +192,8 @@ class TaskManager:
             task = self.store.active_task()
             if task is None:
                 self.initialized = True  # fresh boot with nothing pending is never a failure
+                # rebooted while hot (or blind): cool down before going idle
+                self._begin_cooling(self.mono())
                 return
             if task["status"] == "recovery_required":
                 self.out.all_off()
@@ -211,14 +233,55 @@ class TaskManager:
             elif self.task is not None:  # recovery_required: wait for a person
                 self.out.all_off()
 
-            if self.cooldown_until is not None and now >= self.cooldown_until:
-                self.cooldown_until = None
-                if self.task is None:
-                    self.out.fan.off()
+            if self.cooling is not None and self.task is None and self.recovery is None:
+                self._tick_cooling(now)
 
-    def cancel_cooldown(self):
+    def set_safe_temp(self, value):
+        """Apply the safe shutdown temperature from the web app. Invalid values are ignored."""
         with self.lock:
-            self.cooldown_until = None
+            if not self._safe_temp_ok(value):
+                self.store.log_event("settings_rejected", f"safe temperature {value!r} out of range",
+                                     data={"safe_temp_c": value if _number(value) else None})
+                return False
+            value = float(value)
+            if value == self.safe_temp_c:
+                return True
+            self.safe_temp_c = value
+            self.store.set_meta(safe_temp_c=value)
+            self.store.log_event("settings_applied", f"safe shutdown temperature {value:.1f} C",
+                                 data={"safe_temp_c": value})
+            return True
+
+    def _begin_cooling(self, now):
+        """Heater off, fan on until the measured temperature is safe. No-op if already safe."""
+        self.out.heater.off()
+        temp = self.sensor.temp()
+        if temp is not None and temp <= self.safe_temp_c:
+            self.cooling = None
+            self.out.fan.off()
+            return
+        self.cooling = {"start": now}
+        self.out.fan.on()
+        self.store.log_event("cooling_started", "cooling: heater off, fan on until safe temperature",
+                             data={"temp_c": temp, "safe_temp_c": self.safe_temp_c})
+
+    def _tick_cooling(self, now):
+        self.out.heater.off()  # never heat while cooling
+        self.out.fan.on()
+        waited = now - self.cooling["start"]
+        temp = self.sensor.temp()
+        if temp is not None and temp <= self.safe_temp_c:
+            reason, msg = "cooling_complete", "cooling complete, fan off"
+        elif waited >= self.cfg.COOLDOWN_MAX_SECONDS:
+            reason, msg = "cooling_timeout", "cooling time limit reached, fan off"
+        elif temp is None and waited >= self.cfg.COOLDOWN_NO_SENSOR_SECONDS:
+            reason, msg = "cooling_ended_no_sensor", "no temperature reading while cooling, fan off"
+        else:
+            return
+        self.cooling = None
+        self.out.fan.off()
+        self.store.log_event(reason, msg, data={"temp_c": temp, "safe_temp_c": self.safe_temp_c,
+                                                "cooling_s": round(waited, 1)})
 
     def _tick_running(self, now):
         temp = self.sensor.temp()
@@ -274,7 +337,7 @@ class TaskManager:
             self.segment_start = None
             self._end("completed", None, now, d.diagnostics, reason_in_event=d.reason)
         elif d.action == recovery.FAILED:
-            self._end("failed", d.reason, now, d.diagnostics, cooldown=False)
+            self._end("failed", d.reason, now, d.diagnostics)
         else:
             self.task = self.store.update_task(
                 task["task_id"], status="recovery_required", failure_reason=d.reason,
@@ -305,13 +368,13 @@ class TaskManager:
         self.elapsed_base = elapsed_base
         self.segment_start = now
         self.last_checkpoint = now
-        self.cooldown_until = None
+        self.cooling = None
         # persisted as running before the thermostat may switch the heater on
         self.task = self.store.update_task(
             self.task["task_id"], status="running", failure_reason=None, event=event,
             **self._checkpoint_fields(now, elapsed_base), **extra)
 
-    def _end(self, status, reason, now, diagnostics=None, cooldown=True, reason_in_event=None):
+    def _end(self, status, reason, now, diagnostics=None, reason_in_event=None):
         self.out.heater.off()
         elapsed = self.elapsed(now)
         self.segment_start = None
@@ -328,10 +391,7 @@ class TaskManager:
             self.task["task_id"], status=status, failure_reason=reason, diagnostics=diagnostics,
             ended_wall=self.wall(), event=(f"task_{status}", msg, data), **fields)
         self.task = None
-        if cooldown and self.out.fan.is_active:
-            self.cooldown_until = now + self.cfg.FAN_COOLDOWN_SECONDS
-        else:
-            self.out.fan.off()
+        self._begin_cooling(now)
 
     # ---------------- commands ----------------
     def handle_command(self, cmd):
@@ -351,6 +411,7 @@ class TaskManager:
                 handler = {
                     "start": self._cmd_start,
                     "add_batch": self._cmd_add_batch,
+                    "complete_batch": self._cmd_complete_batch,
                     "cancel": self._cmd_cancel,
                     "resume": self._cmd_resume,
                     "abort": self._cmd_abort,
@@ -467,13 +528,51 @@ class TaskManager:
         task_s = max(self.task["duration_s"], offset + batch_s)
         if task_s > cfg.MAX_DURATION_MIN * 60.0:
             raise Rejected("invalid_duration")
+        # a row freed by an earlier confirmation is being reused
+        done = [r for r in (self.task["completed_rows"] or "").split(",") if r and r != rows]
         self.task = self.store.add_batch(
             task_id, batch_id, int(rows), float(w) if w is not None else None, batch_s, offset,
             task_s, ",".join(sorted(current_rows + [rows], key=int)), self.task["batch_count"] + 1,
+            completed_rows=",".join(done),
             event=("batch_added", "batch added to the running task",
                    {"command_id": cmd["command_id"], "batch_id": batch_id, "row_level": rows,
                     "duration_minutes": dur, "offset_s": round(offset, 1),
                     "task_duration_s": task_s, "requested_by": cmd.get("requested_by")}))
+
+    def _cmd_complete_batch(self, cmd, task_id):
+        """The operator confirmed the batch on one row is dry.
+
+        Frees the row. Other rows keep drying on the thermostat and the schedule is left alone.
+        When the last row is freed the task ends: heater off at once, fan cools the machine.
+        """
+        rows = parse_row_levels(cmd.get("row_levels"), self.cfg.ALLOWED_ROW_LEVELS)
+        if rows is None or "," in rows:
+            raise Rejected("invalid_row_levels")  # exactly one row per confirmation
+        if not self.initialized or self.recovery is not None:
+            raise Rejected("not_ready")
+        self._require_task(task_id, ("running", "recovery_required"))
+
+        active = self.task["row_levels"].split(",")
+        done = [r for r in (self.task["completed_rows"] or "").split(",") if r]
+        if rows not in active:
+            if rows in done:
+                raise Rejected("row_already_completed", "duplicate")
+            raise Rejected("row_not_in_task")
+
+        active.remove(rows)
+        done = sorted(done + [rows], key=int)
+        now = self.mono()
+        event = ("batch_completed", "batch confirmed dry by the operator",
+                 {"command_id": cmd["command_id"], "row_level": int(rows),
+                  "rows_remaining": len(active), "requested_by": cmd.get("requested_by")})
+        if active:
+            self.task = self.store.update_task(
+                self.task["task_id"], row_levels=",".join(active),
+                completed_rows=",".join(done), event=event)
+            return
+        self.task = self.store.update_task(
+            self.task["task_id"], completed_rows=",".join(done), event=event)
+        self._end("completed", None, now, {"completed_by": "operator"})
 
     def _require_task(self, task_id, statuses):
         if self.task is None:
@@ -491,7 +590,7 @@ class TaskManager:
     def _cmd_abort(self, cmd, task_id):
         self._require_task(task_id, ("recovering", "recovery_required"))
         self.recovery = None
-        self._end("cancelled", "aborted_after_interruption", self.mono(), cooldown=False)
+        self._end("cancelled", "aborted_after_interruption", self.mono())
 
     def _cmd_resume(self, cmd, task_id):
         self._require_task(task_id, ("recovery_required",))

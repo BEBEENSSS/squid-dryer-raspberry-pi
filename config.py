@@ -27,7 +27,13 @@ OFFLINE_FAILSAFE_SECONDS = 120  # manual heater only: no successful sync this lo
 TASK_SETPOINT_C = TEMP_MAX_C - TEMP_RESUME_DROP  # thermostat target during a task
 TASK_HYSTERESIS_C = 2.0         # heater back on at setpoint - hysteresis
 CHECKPOINT_SECONDS = 10         # how often running-task progress is saved to disk
-FAN_COOLDOWN_SECONDS = 120      # fan keeps running after a task ends
+
+# cooling after a task ends: heater off at once, fan runs until the measured temperature is safe
+COOLDOWN_SAFE_TEMP_C = 40.0     # default; the web app can change it (settings/safe_temp_c)
+COOLDOWN_SAFE_TEMP_MIN_C = 25.0  # mirrors database.rules.json
+COOLDOWN_SAFE_TEMP_MAX_C = 50.0  # mirrors database.rules.json
+COOLDOWN_MAX_SECONDS = 3600     # a hot room may never reach the threshold, so cooling is capped
+COOLDOWN_NO_SENSOR_SECONDS = 600  # fan runtime if the sensor is dead while cooling
 
 # start command validation (placeholder limits, tune for the machine)
 MAX_WEIGHT_KG = 20.0            # only checked if the web app sends weight_kg

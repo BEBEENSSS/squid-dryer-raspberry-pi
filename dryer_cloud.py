@@ -56,9 +56,15 @@ class ManualControl:
             if want_fan or want_heater:
                 self._event("manual command ignored: drying task active")
             return
+        if self.tm.cooling_active():
+            # cooling is driven by the measured temperature, not by a stale request
+            if want_fan or want_heater:
+                self._event("manual command ignored: machine is cooling")
+                self.sync.request_write("commands/heater", False)
+                self.sync.request_write("commands/fan", False)
+            return
         cfg, fan = self.cfg, self.out.fan
         reject = None
-        self.tm.cancel_cooldown()
 
         if want_fan:
             fan.on()
@@ -91,7 +97,7 @@ class ManualControl:
 
     def tick(self):
         """Limits, auto-off and offline failsafe for manual heating."""
-        if self.tm.busy():
+        if self.tm.busy() or self.tm.cooling_active():
             self.heater_since = None
             return
         cfg = self.cfg
@@ -152,6 +158,8 @@ def main():
     def status():
         ok = sensor.ok()
         machine = tm.machine_status()
+        # a new task may start while cooling once the machine is cool enough to accept it
+        cool_enough = ok and sensor.temp_c < config.TEMP_MAX_C - config.TEMP_RESUME_DROP
         return {
             "fan": out.fan.is_active,
             "heater": out.heater.is_active,
@@ -159,7 +167,9 @@ def main():
             "sensor_ok": ok,
             "temp_max": config.TEMP_MAX_C,
             "status": machine,
-            "ready": machine == "ready" and ok and not out.heater.is_active,
+            "cooling": tm.cooling_active(),
+            "safe_temp": tm.safe_temp_c,
+            "ready": machine in ("ready", "cooling") and cool_enough and not out.heater.is_active,
         }
 
     sync = CloudSync(open_store, tm, status, commands, boot_id)
@@ -193,6 +203,8 @@ def main():
                     ack = tm.handle_command(payload)
                     if ack:
                         print("command:", ack)
+                elif kind == "settings":
+                    tm.set_safe_temp(payload)
                 else:
                     manual.apply(*payload)
 
