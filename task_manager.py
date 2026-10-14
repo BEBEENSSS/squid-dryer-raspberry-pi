@@ -121,6 +121,7 @@ class TaskManager:
         self.wall = wall
         self.cfg = cfg
         self.on_task_start = on_task_start  # e.g. clear manual fan/heater commands
+        self.server_now_ms = None   # callable returning Firebase server time in ms, or None
         self.lock = threading.RLock()
 
         self.task = None            # row of the task that owns the machine, or None
@@ -663,7 +664,12 @@ class TaskManager:
 
     def _check_age(self, cmd):
         requested = cmd.get("requested_at")
-        if _number(requested) and self.clock_synced():
+        server_ms = self.server_now_ms() if self.server_now_ms else None
+        if _number(requested) and server_ms is not None:
+            age = (server_ms - requested) / 1000.0  # both sides are server time, so the Pi clock is irrelevant
+            if age > self.cfg.COMMAND_MAX_AGE_SECONDS:
+                raise Rejected("stale_command")
+        elif _number(requested) and self.clock_synced():
             age = self.wall() - requested / 1000.0
             if age > self.cfg.COMMAND_MAX_AGE_SECONDS:
                 raise Rejected("stale_command")

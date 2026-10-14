@@ -1,10 +1,11 @@
+import os
 from pathlib import Path
 
 # ---------------- device / firebase ----------------
 DEVICE_ID = "squid-dryer"
 DATABASE_URL = "https://squid-dryer-default-rtdb.asia-southeast1.firebasedatabase.app/"
-KEY_PATH = "/home/bensdev/squid-dryer/secrets/serviceAccountKey.json"
-DB_PATH = Path("/home/bensdev/squid-dryer/data/dryer.db")
+KEY_PATH = os.environ.get("SQUID_KEY_PATH", "/home/bensdev/squid-dryer/secrets/serviceAccountKey.json")
+DB_PATH = Path(os.environ.get("SQUID_DB_PATH", "/home/bensdev/squid-dryer/data/dryer.db"))
 
 # ---------------- hardware ----------------
 FAN_PIN = 17
@@ -95,6 +96,12 @@ RESUME_MAX_GAP_SECONDS = 300    # longer interruptions are never auto-resumed
 SYNC_INTERVAL = 2               # seconds between command polls (backup when the stream is down)
 SETTINGS_POLL_SECONDS = 10      # settings change rarely, so they are not read on every poll
 COMMAND_LISTEN = True           # stream commands/task request changes to wake the sync at once
+MANUAL_COMMAND_MAX_AGE_SECONDS = 30  # a Firebase fan/heater command older than this is never applied
+CLOCK_REFRESH_SECONDS = 120     # how often the server time reference is re-read
+LOCAL_API_HOST = os.environ.get("SQUID_API_HOST", "0.0.0.0")  # all interfaces: reachable from the LAN
+LOCAL_API_PORT = int(os.environ.get("SQUID_API_PORT", "8080"))  # the local panel; also published as state/local_url
+WEB_ROOT = Path(os.environ.get("SQUID_WEB_ROOT", "/home/bensdev/squid-dryer/web"))
+PIN_PATH = Path(os.environ.get("SQUID_PIN_PATH", "/home/bensdev/squid-dryer/secrets/local_pin"))
 HEARTBEAT_SECONDS = 30          # max time between state writes while online
 TEMP_PUBLISH_SECONDS = 5        # how often temp is sent to Firebase
 SYNC_BACKOFF_MAX = 30           # retry delay cap while offline

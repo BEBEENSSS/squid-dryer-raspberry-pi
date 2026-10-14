@@ -53,6 +53,7 @@ class FakeBase:
         self.data = {}
         self.fail = False
         self.updates = 0
+        self.server_ms = None  # when set, server timestamps resolve to it like the real database
 
     def _check(self):
         if self.fail:
@@ -79,6 +80,8 @@ class FakeBase:
             node = self.data
             for part in parts[:-1]:
                 node = node.setdefault(part, {})
+            if value == {".sv": "timestamp"} and self.server_ms is not None:
+                value = int(self.server_ms)
             if value is None:
                 node.pop(parts[-1], None)
             else:

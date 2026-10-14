@@ -4,6 +4,8 @@ import threading
 import time
 
 import config
+from server_clock import ServerClock
+from snapshot import ack_payload
 from task_manager import command_key
 
 SERVER_TS = {".sv": "timestamp"}
@@ -40,6 +42,9 @@ class CloudSync:
         self._pending_writes = {}           # e.g. {"commands/heater": False}
         self._last_task_cmd = None
         self._last_manual = None
+        self._last_manual_id = None
+        self._clock_tried = None            # monotonic time of the last server-time read attempt
+        self.server_clock = ServerClock(mono)
         self._last_settings = None
         self._last_publish = None
         self._last_log_upload = None        # when per-minute temperature summaries last went out
@@ -90,6 +95,7 @@ class CloudSync:
             if self._base is None:
                 self._base = self.base_factory()
             self._start_listeners()
+            self._sync_clock()
             self._poll_commands()
             self._publish()
         except Exception as e:
@@ -119,14 +125,49 @@ class CloudSync:
             except Exception:
                 pass
 
+    def _sync_clock(self):
+        """Read the server time back through a heartbeat write, before any command is judged.
+
+        Without it a command left in Firebase before an outage or a restart could not be aged.
+        """
+        age = self.server_clock.age_seconds()
+        if age is not None and age < self.cfg.CLOCK_REFRESH_SECONDS:
+            return
+        now = self.mono()
+        if self._clock_tried is not None and now - self._clock_tried < 30:
+            return  # a read that returned nothing usable is not retried on every poll
+        self._clock_tried = now
+        self._base.update({"state/last_seen": SERVER_TS})
+        value = self._base.child("state/last_seen").get()
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            self.server_clock.set(value)
+
+    def _manual_command_fresh(self, issued_at):
+        now = self.server_clock.now_ms()
+        if now is None or not isinstance(issued_at, (int, float)) or isinstance(issued_at, bool):
+            return False  # cannot prove it is recent, so it must not move a relay
+        return now - issued_at <= self.cfg.MANUAL_COMMAND_MAX_AGE_SECONDS * 1000
+
     def _poll_commands(self):
         # manual commands first: they are the latency-sensitive ones
         cmds = self._base.child("commands").get() or {}
         if isinstance(cmds, dict):
             manual = (cmds.get("fan") is True, cmds.get("heater") is True)
-            if manual != self._last_manual:
+            command_id = cmds.get("command_id")
+            if isinstance(command_id, str) and command_id:
+                # new-style command: applied once, and only while it is recent
+                if command_id != self._last_manual_id:
+                    self._last_manual_id = command_id
+                    self._last_manual = manual
+                    if self._manual_command_fresh(cmds.get("issued_at")):
+                        self.commands.put(("manual", manual + (command_id, "online")))
+                    else:
+                        self.request_write("commands/heater", False)
+                        self.store().log_event("stale_command_ignored", "old fan/heater command ignored",
+                                               data={"command_id": command_id})
+            elif manual != self._last_manual:
                 self._last_manual = manual
-                self.commands.put(("manual", manual))
+                self.commands.put(("manual", manual + (None, "online")))
 
         request = self._base.child("task/request").get()
         key = command_key(request)
@@ -180,13 +221,9 @@ class CloudSync:
         if report is not None:
             report["reported_at"] = SERVER_TS
         updates["task/report"] = report
-        ack = store.last_command()
+        ack = ack_payload(store.last_command())
         if ack:
-            updates["task/ack"] = {
-                "command_id": ack["command_id"], "command": ack["action"], "task_id": ack["task_id"],
-                "result": ack["result"], "reason": ack["reason"],
-                "at": int(ack["processed_wall"] * 1000),
-            }
+            updates["task/ack"] = ack
         last = store.last_event()
         if last:
             updates["state/last_event"] = (last["message"] or last["type"])[:200]

@@ -1,15 +1,25 @@
+import os
 import queue
 import signal
 import threading
 import time
 from pathlib import Path
 
-import config
-import sd_notify
-from cloud_sync import CloudSync
-from hardware import Outputs, Sensor
-from task_manager import TaskManager
-from task_store import TaskStore
+# SIMULATE=1 runs the whole controller with mock pins and a simulated chamber. The pin factory
+# has to be chosen before gpiozero is imported by hardware.
+SIMULATE = os.environ.get("SIMULATE") == "1"
+if SIMULATE:
+    os.environ.setdefault("GPIOZERO_PIN_FACTORY", "mock")
+
+import config  # noqa: E402
+import sd_notify  # noqa: E402
+from cloud_sync import CloudSync  # noqa: E402
+from hardware import Outputs, Sensor  # noqa: E402
+from local_api import LocalApi  # noqa: E402
+from netinfo import lan_ip  # noqa: E402
+from snapshot import build_snapshot  # noqa: E402
+from task_manager import TaskManager  # noqa: E402
+from task_store import TaskStore  # noqa: E402
 
 TIMESYNC_FLAG = Path("/run/systemd/timesync/synchronized")
 
@@ -57,6 +67,10 @@ class ManualControl:
         self.enabled = False
         self.block = None             # why a heater request was refused, for the dashboard
         self.failsafe_tripped = True  # heater blocked after boot until the operator re-enables it
+        self.last_command_id = None     # newest manual command_id received, even if it was refused
+        self.last_command_source = None  # "online", "local" or None
+        self.last_command_at = None      # server time (ms) it was received, None when unknown
+        self.wanted = {"fan": False, "heater": False}  # the newest request, from either panel
         self._latch_seen_off = False
 
     def _event(self, message):
@@ -76,8 +90,14 @@ class ManualControl:
         self._reset_heater_command()
         self._event(reason)
 
-    def apply(self, want_fan, want_heater):
+    def apply(self, want_fan, want_heater, command_id=None, source=None):
         """Apply the wanted state from Firebase with the safety rules."""
+        self.wanted = {"fan": bool(want_fan), "heater": bool(want_heater)}
+        if command_id is not None:
+            self.last_command_id, self.last_command_source = command_id, source
+            clock = getattr(self.sync, "server_clock", None)
+            now = clock.now_ms() if clock else None
+            self.last_command_at = int(now) if now is not None else None
         if self.out.heater.latched is None:
             self._latch_seen_off = False
         elif not want_heater:
@@ -179,7 +199,15 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
 
     out = Outputs()  # both relays off before anything else happens
-    sensor = Sensor()
+    oven = None
+    if SIMULATE:
+        from sim import SimOven
+        oven = SimOven()
+        oven.heater = out.heater
+        sensor = Sensor(oven.read)
+        print("SIMULATE=1: mock relays and a simulated chamber, no hardware is touched")
+    else:
+        sensor = Sensor()
     out.attach_sensor(sensor)
     boot_id = read_boot_id()
 
@@ -235,10 +263,30 @@ def main():
             "manual_heating": manual.enabled,
             "heater_block": heater_block(ok),
             "ready": machine in ("ready", "cooling") and cool_enough and not out.heater.is_active,
+            "command_id": manual.last_command_id,         # None removes the key
+            "command_source": manual.last_command_source,
+            "command_at": manual.last_command_at,
+            "clock_synced": bool(clock_synced()),
+            "local_url": f"http://{ip}:{config.LOCAL_API_PORT}" if (ip := lan_ip()) else None,
         }
 
     sync = CloudSync(open_store, tm, status, commands, boot_id)
+    snapshot = {"value": None}   # swapped whole by the control loop, read by the HTTP thread
+    task_request = {"value": None}  # newest task request seen from either panel
+    last_tick = {"at": time.monotonic()}
+
+    def now_ms():
+        """Server time when known, otherwise the Pi clock (which may be wrong until NTP syncs)."""
+        server = sync.server_clock.now_ms()
+        return int(server) if server is not None else int(time.time() * 1000)
+
+    def publish_snapshot():
+        snapshot["value"] = build_snapshot(
+            state=status(), manual=dict(manual.wanted), settings=tm.settings, request=task_request["value"],
+            report=tm.snapshot(), ack=store.last_command(), pi_now_ms=now_ms(),
+            cloud_online=sync.online, loop_age_s=time.monotonic() - last_tick["at"])
     manual = ManualControl(out, sensor, store, sync, tm)
+    tm.server_now_ms = sync.server_clock.now_ms  # command age is judged on server time, not the Pi clock
 
     # get a first reading before the recovery check starts
     sensor.poll()
@@ -255,7 +303,14 @@ def main():
 
     threading.Thread(target=read_sensor, daemon=True, name="sensor").start()
     threading.Thread(target=sync.run, args=(stop,), daemon=True, name="cloud-sync").start()
-    print("Running. Control it from Firebase.")
+    api = LocalApi(get_snapshot=lambda: snapshot["value"] and dict(
+        snapshot["value"], loop_age_s=round(time.monotonic() - last_tick["at"], 2)),
+        commands=commands, store=store)
+    if api.start():
+        print(f"Local panel on port {api.port}")
+    else:
+        store.log_event("local_api_unavailable", f"local panel could not listen on port {api.port}")
+    print("Running. Control it from Firebase or the local panel.")
     sd_notify.ready()
 
     try:
@@ -275,23 +330,36 @@ def main():
 
             for kind, payload in coalesce_commands(items):
                 if kind == "task":
+                    task_request["value"] = payload
+                    ack = tm.handle_command(payload)
+                    if ack:
+                        print("command:", ack)
+                elif kind == "task_local":
+                    # stamped here so the request is aged on the same clock as one from Firebase
+                    payload = dict(payload, requested_at=now_ms())
+                    task_request["value"] = payload
                     ack = tm.handle_command(payload)
                     if ack:
                         print("command:", ack)
                 elif kind == "settings":
                     tm.apply_settings(payload)
+                elif kind == "settings_local":
+                    # newer than anything applied, so an older write still queued in Firebase cannot undo it
+                    tm.apply_settings(dict(payload, updated_at=max(tm.settings.updated_at + 1, now_ms())))
                 else:
                     manual.apply(*payload)
 
             now = time.monotonic()
             if now >= next_tick:
                 sd_notify.watchdog()  # only a loop that is still ticking keeps systemd satisfied
+                last_tick["at"] = time.monotonic()
                 latched = out.heater.check()
                 if latched:
                     store.log_event("heater_guard", f"heater latched off: {latched}")
                 tm.tick()
                 manual.tick()
                 next_tick = now + config.LOOP_INTERVAL
+                publish_snapshot()
 
             # report a confirmed change at once (commands, thermostat, cooling end, failsafe)
             confirmed = (out.fan.is_active, out.heater.is_active, tm.machine_status())
@@ -299,6 +367,7 @@ def main():
                 last_published = confirmed
                 sync.notify()
     finally:
+        api.stop()
         out.all_off()
         tm.shutdown()
         if stop.is_set():  # a crash is not a clean shutdown

@@ -310,6 +310,12 @@ class TaskStore:
         return [dict(r) for r in self._conn().execute(
             "SELECT * FROM temp_log WHERE task_id=? ORDER BY wall, rowid", (task_id,))]
 
+    def temp_minutes(self, task_id):
+        """Per-minute summaries for one task, oldest first (what task_logs/ holds in Firebase)."""
+        return [dict(r) for r in self._conn().execute(
+            "SELECT minute, n, sum_c, min_c, max_c, raw_last FROM temp_minutes WHERE task_id=? ORDER BY minute",
+            (task_id,))]
+
     def pending_temp_minutes(self, limit=100):
         return [dict(r) for r in self._conn().execute(
             "SELECT * FROM temp_minutes WHERE uploaded=0 ORDER BY task_id, minute LIMIT ?", (limit,))]
