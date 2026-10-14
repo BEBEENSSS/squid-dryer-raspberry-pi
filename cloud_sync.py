@@ -4,6 +4,7 @@ import threading
 import time
 
 import config
+from command_age import cloud_verdict
 from server_clock import ServerClock
 from snapshot import ack_payload
 from task_manager import command_key
@@ -26,7 +27,7 @@ def firebase_base():
 
 class CloudSync:
     def __init__(self, store_factory, tm, status_fn, commands, boot_id,
-                 base_factory=firebase_base, mono=time.monotonic, cfg=config):
+                 base_factory=firebase_base, mono=time.monotonic, cfg=config, local_mark=None):
         self.store_factory = store_factory  # store is opened inside the sync thread
         self.tm = tm
         self.status_fn = status_fn          # dict of live machine state (fan, heater, temp, ...)
@@ -35,6 +36,7 @@ class CloudSync:
         self.base_factory = base_factory
         self.mono = mono
         self.cfg = cfg
+        self.local_mark = local_mark        # when the local panel was last used (command_age.py)
 
         self._base = None
         self._store = None
@@ -142,11 +144,13 @@ class CloudSync:
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             self.server_clock.set(value)
 
-    def _manual_command_fresh(self, issued_at):
+    def _manual_verdict(self, issued_at):
+        """None when the command may move a relay, otherwise the reason it is ignored."""
         now = self.server_clock.now_ms()
         if now is None or not isinstance(issued_at, (int, float)) or isinstance(issued_at, bool):
-            return False  # cannot prove it is recent, so it must not move a relay
-        return now - issued_at <= self.cfg.MANUAL_COMMAND_MAX_AGE_SECONDS * 1000
+            return "unverifiable"  # cannot prove it is recent, so it must not move a relay
+        since_local = self.local_mark.since() if self.local_mark else None
+        return cloud_verdict((now - issued_at) / 1000.0, since_local, self.cfg.CLOUD_COMMAND_MAX_AGE_SECONDS)
 
     def _poll_commands(self):
         # manual commands first: they are the latency-sensitive ones
@@ -159,12 +163,13 @@ class CloudSync:
                 if command_id != self._last_manual_id:
                     self._last_manual_id = command_id
                     self._last_manual = manual
-                    if self._manual_command_fresh(cmds.get("issued_at")):
+                    verdict = self._manual_verdict(cmds.get("issued_at"))
+                    if verdict is None:
                         self.commands.put(("manual", manual + (command_id, "online")))
                     else:
                         self.request_write("commands/heater", False)
-                        self.store().log_event("stale_command_ignored", "old fan/heater command ignored",
-                                               data={"command_id": command_id})
+                        self.store().log_event("stale_command_ignored", f"fan/heater command ignored: {verdict}",
+                                               data={"command_id": command_id, "reason": verdict})
             elif manual != self._last_manual:
                 self._last_manual = manual
                 self.commands.put(("manual", manual + (None, "online")))

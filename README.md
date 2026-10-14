@@ -13,6 +13,9 @@ The Pi is the authority on what the machine is actually doing. Firebase is used 
 | `task_store.py` | SQLite record (`data/dryer.db`): tasks, temperature log, event outbox, processed commands |
 | `cloud_sync.py` | Background Firebase thread: command stream + polling, heartbeat, event upload |
 | `hardware.py` | Relays and sensor reading (unchanged logic) |
+| `local_api.py` | Local HTTP API and the web panel, so the machine works from a phone with no internet |
+| `netwatch.py`, `net_policy.py` | Own service: home Wi-Fi first, hotspot as fallback (`net_policy.py` is the pure decision logic) |
+| `command_age.py` | Pure rules for rejecting old cloud commands |
 | `config.py` | All tunable values |
 
 Run the tests with `.venv/bin/python -m pytest` (the relays are mocked, so no hardware is touched).
@@ -109,7 +112,9 @@ The rules are checked in this order:
 | `COOLDOWN_SAFE_TEMP_C` | 40 | default cooldown temperature; the web app can change it (`settings/safe_temp_c`, 25–50) |
 | `COOLDOWN_MAX_SECONDS` | 3600 | cooling is cut off after this long |
 | `COOLDOWN_NO_SENSOR_SECONDS` | 600 | fan run time if the sensor is dead while cooling |
-| `COMMAND_MAX_AGE_SECONDS` | 600 | older commands are rejected as `stale_command` (only checked when the clock is synced) |
+| `CLOUD_COMMAND_MAX_AGE_SECONDS` | 30 | a command that came through Firebase (fan/heater or task) made more than this long ago is ignored; so is one made before the latest local command. Task requests are aged from `issued_at`, falling back to `requested_at`. Rejections are acked as `stale_command` |
+| `COMMAND_MAX_AGE_SECONDS` | 600 | the same rule for requests that do not come through Firebase (only checked when the clock is synced) |
+| `TEMP_PLAUSIBLE_MIN_C`, `_MAX_C` | -10, 100 | a reading outside this range counts as a failed read, which turns the heater off |
 | `MAX_BATCH_COUNT`, `MIN/MAX_DURATION_MIN` | 100, 1–10080 | start validation, same limits as `database.rules.json` |
 | `ALLOWED_ROW_LEVELS`, `MAX_WEIGHT_KG` | 1–4, 20 | **placeholders, set them for the machine**. Weight is only checked when sent |
 
@@ -172,3 +177,87 @@ The schema follows the web app. Security rules are in `database.rules.json`. The
 - If only `connection_lost` / `connection_restored` events appear, it was just an internet outage.
 
 To notify the user about a technical failure, watch `task/report`. `status == "failed"` (`reason` says why, e.g. `possible_power_loss` or `sensor_failure`) needs an `acknowledge`; `recovery_required` needs a `resume` or `abort`.
+
+## Local mode and networking
+
+The machine can be controlled from a phone with no internet at all. The Pi serves the web panel and its API itself (`local_api.py`, port 8080), and a second service, `netwatch.py`, keeps the Pi reachable: it joins the home Wi-Fi when it can and raises its own hotspot when it cannot. The relay control loop never waits for either of them.
+
+The panel and the API are the same ones the cloud commands use: every command, from Firebase or from the phone, goes through the same queue into the same `ManualControl` and `TaskManager`. The heater limits, the sensor-failure cut-off and the runtime guard sit below that queue and override any command from any source.
+
+### Install
+
+On the Pi, from the repo folder (the venv is created if it is missing):
+
+```
+sudo bash deploy/install.sh
+sudo -u bensdev .venv/bin/python local_api.py --set-pin     # the panel always asks for this PIN
+```
+
+`install.sh` is safe to run again. It installs both services, asks once for the hotspot password (8 to 63 characters, stored in `secrets/hotspot_psk`, which git ignores), creates the hotspot profile and starts everything. Both services start on power-up and restart if they crash.
+
+All network settings are in the `NET_*` block of `config.py`. Each can also be set with an environment variable of the same name prefixed with `SQUID_` (for example `SQUID_NET_BOOT_GRACE_SECONDS=300`).
+
+| Value | Default | Meaning |
+|---|---|---|
+| `NET_WIFI_CONNECTION` | `netplan-wlan0-ANN-ANN 5G` | NetworkManager profile of the home Wi-Fi, exactly as `nmcli connection show` prints it. Spaces are fine. **netwatch never renames or edits this profile** |
+| `NET_HOTSPOT_CONNECTION`, `NET_HOTSPOT_SSID` | `squid-hotspot`, `SquidDryer` | the hotspot profile name and the network name phones see |
+| `NET_HOTSPOT_PSK_PATH` | `secrets/hotspot_psk` | the WPA2 password |
+| `NET_HOTSPOT_BAND`, `NET_HOTSPOT_CHANNEL` | `bg`, 6 | 2.4 GHz, for range and so that every phone can join, even though the home network is 5 GHz |
+| `NET_HOTSPOT_ADDRESS` | `10.42.0.1/24` | fixed address in hotspot mode |
+| `NET_BOOT_GRACE_SECONDS` | 180 | after power-on, wait this long for the router before considering the hotspot |
+| `NET_RETRY_INTERVAL_SECONDS` | 120 | an empty hotspot tries the home Wi-Fi this often |
+| `NET_WIFI_TRY_TIMEOUT_SECONDS` | 40 | how long one try at the home Wi-Fi may take |
+| `NET_WIFI_DROP_GRACE_SECONDS` | 60 | a lost Wi-Fi link gets this long to come back before the Pi tries explicitly and then raises the hotspot |
+
+### How it decides
+
+- **Wi-Fi is the default.** The hotspot is a temporary fallback.
+- **After power-on**, the Pi waits up to the boot grace period for the router, which may boot slower than the Pi. Meanwhile it asks for the Wi-Fi every 30 s, because NetworkManager gives up on automatic retries after a few failures.
+- **Wi-Fi without internet stays Wi-Fi.** Internet is not part of the decision. Use the LAN address.
+- **In hotspot mode with nobody connected**, every retry interval the hotspot is switched off for up to 40 s while the home Wi-Fi is tried, then restored if that fails. The Pi does not scan while the hotspot is up (one radio cannot do both).
+- **A phone connected to the hotspot is never kicked off.** The count of connected phones is read from `iw`; if it cannot be read, the Pi assumes someone is connected.
+- **If the Wi-Fi drops while running**, NetworkManager gets 60 s, then the Pi tries once explicitly, then raises the hotspot and follows the rules above.
+- Every transition is logged with a timestamp: `journalctl -u squid-netwatch -f`.
+
+netwatch checks on start that NetworkManager manages `wlan0`, that the home profile exists and that the hotspot password file is valid. If not, it logs why and touches nothing.
+
+### Finding the Pi
+
+| Situation | Address |
+|---|---|
+| Home Wi-Fi (LAN) | `http://<lan address>:8080`. The Pi also publishes it as `state/local_url`; look it up in the router's device list or with `hostname -I` on the Pi |
+| Hotspot | join `SquidDryer`, then open `http://10.42.0.1:8080` |
+
+**Give the Pi a fixed LAN address.** The simplest way is a DHCP reservation for the Pi's MAC address in the router (`ip link show wlan0`). That needs no change on the Pi. Setting a static address on the home profile (`nmcli connection modify "<profile>" ipv4.method manual ipv4.addresses ... ipv4.gateway ... ipv4.dns ...`) also works, but on this Pi the profile is owned by netplan, so check afterwards that the setting survived a reboot, and test it with the router in reach before relying on it.
+
+On the hotspot the address is fixed by `NET_HOTSPOT_ADDRESS`. Use the IP address rather than a hostname, since phones often do not resolve `.local` names.
+
+### Phone tips
+
+- On the hotspot, the phone will say "no internet" and may offer to switch back to mobile data. Tap **Stay connected** (Android) or leave "Auto-Join" on (iPhone), and turn off mobile data while you use the panel. Otherwise the browser may send the request out through mobile data instead of to the Pi.
+- Open the panel by IP address, not by a hostname.
+- If the hotspot does not show up on a phone, check `iw reg get`: a country must be set (`raspi-config`, Localisation Options, WLAN Country).
+
+### Deploying the web panel
+
+The Pi never builds or installs anything for the web side. On the computer with the web app: `npm run deploy:pi` (see the web repo README). That builds the local-mode bundle and copies only `dist-pi/` to the Pi's web folder (`SQUID_WEB_ROOT`).
+
+### Stale cloud commands
+
+A browser can queue a write while offline and deliver it later. The Pi therefore ignores a cloud command when it was made more than `CLOUD_COMMAND_MAX_AGE_SECONDS` (30 s) before it was read, and also when it was made before the most recent local command. Ignored fan/heater commands are logged as `stale_command_ignored` (with `reason` `too_old`, `superseded_by_local` or `unverifiable`) and a left-over heater request is withdrawn. Ignored task requests are acked as `rejected` with reason `stale_command`. Ages are compared as durations on the server clock, so a wrong Pi clock cannot cause or hide a stale command.
+
+When the internet comes back, the Pi publishes its current actual state at once (`state/*`), so the online dashboard shows the truth rather than what was last requested.
+
+### Manual test checklist
+
+1. **Router slower than the Pi.** Power off both, power on the Pi, power on the router about 60 s later. Within a minute or two of the router being ready, the Pi is on Wi-Fi and `nmcli connection show --active` does not list `squid-hotspot`. The log never says "starting the hotspot".
+2. **Router off.** After about 3 minutes `SquidDryer` appears. Join it from a phone, open `http://10.42.0.1:8080`, enter the PIN and switch the fan and the heater.
+3. **Router back while a phone is on the hotspot.** Switch the router on. The phone stays connected and the log shows no "trying the home Wi-Fi".
+4. **Phone leaves the hotspot.** Disconnect the phone. Within about 120 s plus 40 s the Pi is on the home Wi-Fi and the hotspot is gone.
+5. **Wi-Fi up, internet down.** Unplug the router's WAN cable. The Pi stays on Wi-Fi, no hotspot appears, and `http://<lan address>:8080` works. The panel banner shows "cloud offline".
+6. **Internet returns.** Plug the WAN cable back in. Within a few seconds the online dashboard shows the current fan, heater and temperature.
+7. **Late cloud command.** Disconnect the Pi from the internet, send a fan command from the online app, wait over 30 s, reconnect. The fan does not change, and the `events` list shows `stale_command_ignored`.
+8. **Local beats an older cloud command.** Send a cloud fan command and, within 30 s and before the Pi has read it, use the panel to set a different state. The panel's state wins and `stale_command_ignored` shows `superseded_by_local`.
+9. **Heater cut-off.** With a low `heater_cutoff_c` the heater turns off at that temperature. Unplug the temperature sensor: the heater turns off with `heater_block: sensor_fault`, whatever command is sent from the cloud or the panel.
+10. **Reboot persistence.** After `sudo reboot`, `nmcli connection show squid-hotspot` still exists with `connection.autoconnect: no` and band `bg`, and the home profile still has its original name. (On a netplan system the profile is stored under `/etc/netplan/`; netwatch repairs the hotspot profile on every start if it is missing.)
+11. **Cloud mode unchanged.** Log in to the online app: manual toggles, starting and cancelling a task, and the dashboard all behave as before.

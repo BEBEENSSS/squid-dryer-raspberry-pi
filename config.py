@@ -96,7 +96,7 @@ RESUME_MAX_GAP_SECONDS = 300    # longer interruptions are never auto-resumed
 SYNC_INTERVAL = 2               # seconds between command polls (backup when the stream is down)
 SETTINGS_POLL_SECONDS = 10      # settings change rarely, so they are not read on every poll
 COMMAND_LISTEN = True           # stream commands/task request changes to wake the sync at once
-MANUAL_COMMAND_MAX_AGE_SECONDS = 30  # a Firebase fan/heater command older than this is never applied
+CLOUD_COMMAND_MAX_AGE_SECONDS = 30  # a Firebase command (manual or task) older than this is never applied
 CLOCK_REFRESH_SECONDS = 120     # how often the server time reference is re-read
 LOCAL_API_HOST = os.environ.get("SQUID_API_HOST", "0.0.0.0")  # all interfaces: reachable from the LAN
 LOCAL_API_PORT = int(os.environ.get("SQUID_API_PORT", "8080"))  # the local panel; also published as state/local_url
@@ -108,3 +108,31 @@ SYNC_BACKOFF_MAX = 30           # retry delay cap while offline
 EVENT_BATCH = 50                # events uploaded per write
 
 LOOP_INTERVAL = 0.5             # control loop tick
+
+# ---------------- network fallback (netwatch.py) ----------------
+# Wi-Fi first, own hotspot only when the home router cannot be reached. Every value can be
+# overridden by an environment variable of the same name with a SQUID_ prefix.
+def _env(name, default, cast=str):
+    value = os.environ.get(f"SQUID_{name}")
+    return default if value is None else cast(value)
+
+
+NET_IFACE = _env("NET_IFACE", "wlan0")
+# The NetworkManager profile of the home Wi-Fi, exactly as `nmcli con show` prints it (spaces are fine).
+NET_WIFI_CONNECTION = _env("NET_WIFI_CONNECTION", "netplan-wlan0-ANN-ANN 5G")
+NET_HOTSPOT_CONNECTION = _env("NET_HOTSPOT_CONNECTION", "squid-hotspot")
+NET_HOTSPOT_SSID = _env("NET_HOTSPOT_SSID", "SquidDryer")
+# WPA2 password, kept out of git: written by `python netwatch.py --setup`, 8 to 63 characters.
+NET_HOTSPOT_PSK_PATH = Path(_env("NET_HOTSPOT_PSK_PATH", "/home/bensdev/squid-dryer/secrets/hotspot_psk"))
+NET_HOTSPOT_BAND = _env("NET_HOTSPOT_BAND", "bg")             # 2.4 GHz: best range, every phone can join
+NET_HOTSPOT_CHANNEL = _env("NET_HOTSPOT_CHANNEL", 6, int)
+NET_HOTSPOT_ADDRESS = _env("NET_HOTSPOT_ADDRESS", "10.42.0.1/24")  # fixed address in hotspot mode
+NET_BOOT_GRACE_SECONDS = _env("NET_BOOT_GRACE_SECONDS", 180, float)  # wait this long after power-on for the router
+NET_RETRY_INTERVAL_SECONDS = _env("NET_RETRY_INTERVAL_SECONDS", 120, float)  # empty hotspot: retry Wi-Fi this often
+NET_WIFI_TRY_TIMEOUT_SECONDS = _env("NET_WIFI_TRY_TIMEOUT_SECONDS", 40, float)
+NET_WIFI_DROP_GRACE_SECONDS = _env("NET_WIFI_DROP_GRACE_SECONDS", 60, float)  # a lost link may come back by itself
+NET_POLL_SECONDS = _env("NET_POLL_SECONDS", 5, float)
+NET_ASSIST_SECONDS = _env("NET_ASSIST_SECONDS", 30, float)  # while waiting for the router, ask for Wi-Fi this often
+NET_ASSIST_TIMEOUT_SECONDS = _env("NET_ASSIST_TIMEOUT_SECONDS", 20, float)
+NET_STATUS_PATH = Path(_env("NET_STATUS_PATH", "/run/squid-dryer/network.json"))
+NET_STATUS_MAX_AGE_SECONDS = 30  # an older status file means netwatch is not running

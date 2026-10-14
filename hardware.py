@@ -29,6 +29,10 @@ def read_temp(sensor_dir=None):
     if value == -127.0 or value == 85.0:
         return None
 
+    # a reading no real chamber can produce is a failing sensor, and a failed read turns the heater off
+    if not config.TEMP_PLAUSIBLE_MIN_C <= value <= config.TEMP_PLAUSIBLE_MAX_C:
+        return None
+
     return value
 
 

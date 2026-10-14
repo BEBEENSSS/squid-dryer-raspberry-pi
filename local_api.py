@@ -172,7 +172,8 @@ def parse_task_request(body):
 # ---------------- server ----------------
 class LocalApi:
     def __init__(self, *, get_snapshot, commands, store, pin_path=None, web_root=None, host=None,
-                 port=None, mono=time.monotonic):
+                 port=None, mono=time.monotonic, local_mark=None):
+        self.local_mark = local_mark       # touched on every accepted command, so older cloud ones lose
         self.get_snapshot = get_snapshot   # callable returning the latest snapshot dict or None
         self.commands = commands           # the queue the control loop reads
         self.store = store
@@ -181,6 +182,10 @@ class LocalApi:
         self.host = host if host is not None else config.LOCAL_API_HOST
         self.port = config.LOCAL_API_PORT if port is None else port
         self._server = None
+
+    def _mark_local(self):
+        if self.local_mark is not None:
+            self.local_mark.touch()
 
     def start(self):
         """Returns True when listening. A port that cannot be bound never stops the controller."""
@@ -298,17 +303,20 @@ class LocalApi:
                         parsed, err = parse_manual(body)
                         if err:
                             return self._json(400, {"error": err})
+                        api._mark_local()
                         api.commands.put(("manual", parsed + ("local",)))
                         return self._json(202, {"command_id": parsed[2]})
                     if path == "/api/settings":
                         parsed, err = parse_settings(body)
                         if err:
                             return self._json(400, {"error": err})
+                        api._mark_local()
                         api.commands.put(("settings_local", parsed))
                         return self._json(202, {"ok": True})
                     parsed, err = parse_task_request(body)
                     if err:
                         return self._json(400, {"error": err})
+                    api._mark_local()
                     api.commands.put(("task_local", parsed))
                     return self._json(202, {"command_id": parsed["command_id"]})
                 self._json(404, {"error": "not_found"})

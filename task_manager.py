@@ -9,6 +9,7 @@ from statistics import median
 import config
 import recovery
 import warmup
+from command_age import cloud_verdict
 from machine_settings import HeaterCutoff, MachineSettings
 from task_store import SNAPSHOT_FIELDS
 
@@ -122,6 +123,7 @@ class TaskManager:
         self.cfg = cfg
         self.on_task_start = on_task_start  # e.g. clear manual fan/heater commands
         self.server_now_ms = None   # callable returning Firebase server time in ms, or None
+        self.local_mark = None      # command_age.LocalCommandMark, set by the controller
         self.lock = threading.RLock()
 
         self.task = None            # row of the task that owns the machine, or None
@@ -627,8 +629,12 @@ class TaskManager:
         self._begin_cooling(now)
 
     # ---------------- commands ----------------
-    def handle_command(self, cmd):
-        """Validate and apply a task command. Returns the ack dict, or None if already processed."""
+    def handle_command(self, cmd, cloud=False):
+        """Validate and apply a task command. Returns the ack dict, or None if already processed.
+
+        `cloud` marks a request that came through Firebase, which can arrive long after it was made
+        and so gets the strict age rules. The local panel is answered at once and is not aged this way.
+        """
         cid = command_key(cmd)
         if cid is None:
             return None  # nothing to acknowledge against
@@ -640,7 +646,7 @@ class TaskManager:
                 return None  # duplicate delivery of an already handled command
             result, reason = "accepted", None
             try:
-                self._check_age(cmd)
+                self._check_age(cmd, cloud)
                 handler = {
                     "start": self._cmd_start,
                     "add_batch": self._cmd_add_batch,
@@ -662,16 +668,27 @@ class TaskManager:
             return {"command_id": cid, "command": action, "task_id": task_id,
                     "result": result, "reason": reason}
 
-    def _check_age(self, cmd):
+    def _check_age(self, cmd, cloud=False):
         requested = cmd.get("requested_at")
+        issued = cmd.get("issued_at")
         server_ms = self.server_now_ms() if self.server_now_ms else None
+        limit = self.cfg.COMMAND_MAX_AGE_SECONDS
+        if cloud:
+            limit = self.cfg.CLOUD_COMMAND_MAX_AGE_SECONDS
+            if _number(issued) and server_ms is not None:
+                # issued_at is when the browser made the request; requested_at is only when it was
+                # delivered, which is exactly what an offline outage stretches
+                since_local = self.local_mark.since() if self.local_mark else None
+                if cloud_verdict((server_ms - issued) / 1000.0, since_local, limit):
+                    raise Rejected("stale_command")
+                return
         if _number(requested) and server_ms is not None:
             age = (server_ms - requested) / 1000.0  # both sides are server time, so the Pi clock is irrelevant
-            if age > self.cfg.COMMAND_MAX_AGE_SECONDS:
+            if age > limit:
                 raise Rejected("stale_command")
         elif _number(requested) and self.clock_synced():
             age = self.wall() - requested / 1000.0
-            if age > self.cfg.COMMAND_MAX_AGE_SECONDS:
+            if age > limit:
                 raise Rejected("stale_command")
 
     def _cmd_start(self, cmd, task_id):

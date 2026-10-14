@@ -1,0 +1,28 @@
+[Unit]
+Description=Squid dryer network fallback (home Wi-Fi first, hotspot second)
+# Needs NetworkManager only to talk to it; the controller does not depend on this service at all.
+After=NetworkManager.service
+Wants=NetworkManager.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+# root: creating and activating system connections with nmcli needs it
+User=root
+WorkingDirectory=/home/bensdev/squid-dryer
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/bensdev/squid-dryer/.venv/bin/python netwatch.py
+Restart=always
+RestartSec=3
+# a Wi-Fi probe can legitimately block for about a minute, so the watchdog is generous
+WatchdogSec=150
+# the status file the controller reads; kept across restarts so the panel does not flicker
+RuntimeDirectory=squid-dryer
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

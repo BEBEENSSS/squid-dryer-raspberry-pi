@@ -14,9 +14,10 @@ if SIMULATE:
 import config  # noqa: E402
 import sd_notify  # noqa: E402
 from cloud_sync import CloudSync  # noqa: E402
+from command_age import LocalCommandMark  # noqa: E402
 from hardware import Outputs, Sensor  # noqa: E402
 from local_api import LocalApi  # noqa: E402
-from netinfo import lan_ip  # noqa: E402
+from netinfo import lan_ip, read_network_status  # noqa: E402
 from snapshot import build_snapshot  # noqa: E402
 from task_manager import TaskManager  # noqa: E402
 from task_store import TaskStore  # noqa: E402
@@ -270,7 +271,9 @@ def main():
             "local_url": f"http://{ip}:{config.LOCAL_API_PORT}" if (ip := lan_ip()) else None,
         }
 
-    sync = CloudSync(open_store, tm, status, commands, boot_id)
+    local_mark = LocalCommandMark()  # the operator at the machine outranks older requests from the cloud
+    tm.local_mark = local_mark
+    sync = CloudSync(open_store, tm, status, commands, boot_id, local_mark=local_mark)
     snapshot = {"value": None}   # swapped whole by the control loop, read by the HTTP thread
     task_request = {"value": None}  # newest task request seen from either panel
     last_tick = {"at": time.monotonic()}
@@ -284,7 +287,8 @@ def main():
         snapshot["value"] = build_snapshot(
             state=status(), manual=dict(manual.wanted), settings=tm.settings, request=task_request["value"],
             report=tm.snapshot(), ack=store.last_command(), pi_now_ms=now_ms(),
-            cloud_online=sync.online, loop_age_s=time.monotonic() - last_tick["at"])
+            cloud_online=sync.online, loop_age_s=time.monotonic() - last_tick["at"],
+            wifi=read_network_status(config.NET_STATUS_PATH, config.NET_STATUS_MAX_AGE_SECONDS))
     manual = ManualControl(out, sensor, store, sync, tm)
     tm.server_now_ms = sync.server_clock.now_ms  # command age is judged on server time, not the Pi clock
 
@@ -305,7 +309,7 @@ def main():
     threading.Thread(target=sync.run, args=(stop,), daemon=True, name="cloud-sync").start()
     api = LocalApi(get_snapshot=lambda: snapshot["value"] and dict(
         snapshot["value"], loop_age_s=round(time.monotonic() - last_tick["at"], 2)),
-        commands=commands, store=store)
+        commands=commands, store=store, local_mark=local_mark)
     if api.start():
         print(f"Local panel on port {api.port}")
     else:
@@ -331,7 +335,7 @@ def main():
             for kind, payload in coalesce_commands(items):
                 if kind == "task":
                     task_request["value"] = payload
-                    ack = tm.handle_command(payload)
+                    ack = tm.handle_command(payload, cloud=True)
                     if ack:
                         print("command:", ack)
                 elif kind == "task_local":
