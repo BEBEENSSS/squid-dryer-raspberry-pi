@@ -40,7 +40,7 @@ class CloudSync:
         self._pending_writes = {}           # e.g. {"commands/heater": False}
         self._last_task_cmd = None
         self._last_manual = None
-        self._last_safe_temp = None
+        self._last_settings = None
         self._last_publish = None
         self._last_settings_poll = None
         self._last_sig = None               # machine state as last published, minus temp
@@ -138,11 +138,9 @@ class CloudSync:
                 or now - self._last_settings_poll >= self.cfg.SETTINGS_POLL_SECONDS):
             settings = self._base.child("settings").get()
             self._last_settings_poll = now
-            if isinstance(settings, dict) and "safe_temp_c" in settings:
-                safe = settings["safe_temp_c"]
-                if safe != self._last_safe_temp:
-                    self._last_safe_temp = safe
-                    self.commands.put(("settings", safe))
+            if isinstance(settings, dict) and settings and settings != self._last_settings:
+                self._last_settings = dict(settings)
+                self.commands.put(("settings", dict(settings)))
 
     def _publish(self):
         store = self.store()

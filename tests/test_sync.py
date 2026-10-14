@@ -2,7 +2,7 @@ import queue
 
 import config
 from cloud_sync import CloudSync
-from dryer_cloud import ManualControl
+from dryer_cloud import ManualControl, coalesce_commands
 
 
 def make_sync(rig, base):
@@ -121,9 +121,9 @@ def test_manual_mode_blocked_during_task(rig):
     rig.run(3)
     manual.apply(False, False)  # would normally switch everything off
     assert rig.out.fan.is_active
-    # offline failsafe does not touch task heating
+    # being offline does not touch task heating
     base.fail = True
-    rig.clock.advance(config.OFFLINE_FAILSAFE_SECONDS + 10)
+    rig.clock.advance(300)
     sync.sync_once()
     manual.tick()
     rig.oven.fixed = 40
@@ -131,23 +131,85 @@ def test_manual_mode_blocked_during_task(rig):
     assert rig.out.heater.is_active and rig.task()["status"] == "running"
 
 
-def test_manual_failsafe_still_works_without_task(rig):
+def _manual_rig(rig, online=True):
     from tests.conftest import FakeBase
     base = FakeBase()
     sync, q = make_sync(rig, base)
     manual = ManualControl(rig.out, rig.sensor, rig.store, sync, rig.tm, mono=lambda: rig.clock.mono)
+    if online:
+        sync.sync_once()
+        manual.tick()  # clears the boot block once online
+    return manual, sync, base
+
+
+def _reading(rig, temp):
+    rig.oven.fixed = temp
+    rig.clock.advance(2)
+    rig.sensor.poll()
+
+
+def test_manual_heating_blocked_after_boot_until_reenabled_then_runs_offline(rig):
+    manual, sync, base = _manual_rig(rig, online=False)
+    _reading(rig, 30)
     manual.apply(True, True)
     assert not rig.out.heater.is_active  # blocked until Firebase confirms
+    assert manual.block == "reboot_block"
     sync.sync_once()
     manual.tick()
     manual.apply(True, True)
-    assert rig.out.heater.is_active
+    assert rig.out.heater.is_active and manual.enabled
+    # the saved target is held locally, so losing the connection changes nothing
     base.fail = True
-    rig.clock.advance(config.OFFLINE_FAILSAFE_SECONDS + 1)
-    rig.sensor.poll()
+    rig.clock.advance(3600)
+    _reading(rig, 30)
     sync.sync_once()
     manual.tick()
+    assert rig.out.heater.is_active
+    _reading(rig, 47.5)  # at or above the saved target: heater off, still enabled
+    manual.tick()
+    assert not rig.out.heater.is_active and manual.enabled
+    _reading(rig, 46)  # inside the hysteresis band: stays off
+    manual.tick()
     assert not rig.out.heater.is_active
+    _reading(rig, 45)  # target - hysteresis: back on
+    manual.tick()
+    assert rig.out.heater.is_active
+
+
+def test_manual_cutoff_overrides_target_and_recovers_with_margin(rig):
+    manual, _, _ = _manual_rig(rig)
+    rig.tm.apply_settings({"manual_target_temp_c": 55, "heater_cutoff_c": 50})
+    _reading(rig, 40)
+    manual.apply(True, True)
+    assert rig.out.heater.is_active
+    _reading(rig, 50)
+    manual.tick()
+    assert not rig.out.heater.is_active and rig.tm.cutoff.active and manual.enabled
+    _reading(rig, 48)  # inside the margin: no rapid switching
+    manual.tick()
+    assert not rig.out.heater.is_active
+    _reading(rig, 47)  # limit - margin: released, heating still wanted
+    manual.tick()
+    assert rig.out.heater.is_active and not rig.tm.cutoff.active
+
+
+def test_manual_faults_disable_heating_regardless_of_cutoff(rig):
+    manual, _, _ = _manual_rig(rig)
+    _reading(rig, 40)
+    manual.apply(True, True)
+    assert rig.out.heater.is_active
+    _reading(rig, config.TEMP_MAX_C)
+    manual.tick()
+    assert not rig.out.heater.is_active and not manual.enabled and manual.block == "over_temperature"
+    _reading(rig, 40)
+    manual.apply(True, True)
+    assert rig.out.heater.is_active
+    rig.oven.broken = True
+    rig.clock.advance(config.SENSOR_STALE_SECONDS + 1)
+    for _ in range(config.SENSOR_BAD_LIMIT):
+        rig.sensor.poll()
+    manual.tick()
+    assert not rig.out.heater.is_active and not manual.enabled and manual.block == "sensor_fault"
 
 
 def test_safe_temp_setting_is_polled_once(rig):
@@ -165,12 +227,15 @@ def test_safe_temp_setting_is_polled_once(rig):
 
     base.data = {"settings": {"safe_temp_c": 33}}
     assert sync.sync_once()
-    assert settings_items() == [33]
+    assert settings_items() == [{"safe_temp_c": 33}]
     assert sync.sync_once()
     assert settings_items() == []  # unchanged value is not re-delivered
     base.data["settings"]["safe_temp_c"] = 36
     assert sync.sync_once()
-    assert settings_items() == [36]
+    assert settings_items() == []  # settings are only re-read every SETTINGS_POLL_SECONDS
+    rig.clock.advance(config.SETTINGS_POLL_SECONDS)
+    assert sync.sync_once()
+    assert settings_items() == [{"safe_temp_c": 36}]
 
 
 def test_manual_commands_ignored_while_cooling(rig):
@@ -187,3 +252,80 @@ def test_manual_commands_ignored_while_cooling(rig):
     manual.apply(True, True)
     assert not rig.out.heater.is_active and rig.out.fan.is_active
     assert sync._pending_writes == {"commands/heater": False, "commands/fan": False}
+
+
+def test_state_change_publishes_without_waiting_for_the_timer(rig):
+    from tests.conftest import FakeBase
+    base = FakeBase()
+    sync, q = make_sync(rig, base)
+    assert sync.sync_once()
+    n = base.updates
+    rig.clock.advance(1)
+    assert sync.sync_once()
+    assert base.updates == n  # nothing changed, inside the publish interval
+    rig.out.fan.on()
+    assert sync.sync_once()
+    assert base.updates == n + 1 and base.data["state"]["fan"] is True
+    rig.clock.advance(1)
+    assert sync.sync_once()
+    assert base.updates == n + 1
+    sync.notify()
+    assert sync.sync_once()
+    assert base.updates == n + 2
+
+
+def test_temp_change_alone_does_not_force_a_publish(rig):
+    from tests.conftest import FakeBase
+    base = FakeBase()
+    status = {"fan": False, "temp": 30.0}
+    q = queue.Queue()
+    sync = CloudSync(lambda: rig.store, rig.tm, lambda: dict(status), q, rig.boot_id,
+                     base_factory=lambda: base, mono=lambda: rig.clock.mono)
+    assert sync.sync_once()
+    n = base.updates
+    status["temp"] = 31.0
+    rig.clock.advance(1)
+    assert sync.sync_once()
+    assert base.updates == n
+
+
+def test_listener_wakes_sync_and_failure_falls_back_to_polling(rig):
+    from tests.conftest import FakeBase
+    base = FakeBase()
+    sync, q = make_sync(rig, base)
+    assert sync.sync_once()  # FakeBase cannot stream: polling still works
+    assert sync._listeners == []
+
+    callbacks, closed = [], []
+
+    class Listener:
+        def close(self):
+            closed.append(True)
+
+    class StreamBase(FakeBase):
+        def child(self, path):
+            ref = super().child(path)
+            ref.listen = lambda cb: (callbacks.append(cb), Listener())[1]
+            return ref
+
+    sync, q = make_sync(rig, StreamBase())
+    sync._wake.clear()
+    assert sync.sync_once()
+    assert len(callbacks) == 2 and len(sync._listeners) == 2
+    sync._wake.clear()
+    callbacks[0]({"event": "put"})
+    assert sync._wake.is_set()
+    sync._base.fail = True
+    assert not sync.sync_once()
+    assert len(closed) == 2 and sync._listeners == []  # reopened after reconnect
+    sync._base.fail = False
+    assert sync.sync_once()
+    assert len(sync._listeners) == 2
+
+
+def test_coalesce_keeps_task_order_and_only_the_latest_manual():
+    items = [("manual", (True, False)), ("task", "a"), ("manual", (True, True)),
+             ("settings", {"safe_temp_c": 33}), ("manual", (False, False))]
+    assert coalesce_commands(items) == [("task", "a"), ("settings", {"safe_temp_c": 33}),
+                                        ("manual", (False, False))]
+    assert coalesce_commands([]) == []

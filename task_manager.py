@@ -7,6 +7,7 @@ import time
 
 import config
 import recovery
+from machine_settings import HeaterCutoff, MachineSettings
 
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
@@ -96,20 +97,18 @@ class TaskManager:
         self.last_checkpoint = 0.0
         self.recovery = None        # observation state while deciding after a restart
         self.cooling = None         # {"start": monotonic} while the fan runs the machine down
-        self.safe_temp_c = self._load_safe_temp()
+        self.settings = MachineSettings(store, cfg)  # persisted on the Pi, loaded here on every boot
+        self.cutoff = HeaterCutoff(store, cfg.HEATER_CUTOFF_MARGIN_C)
         self.initialized = False
 
-    def _load_safe_temp(self):
-        saved = self.store.get_meta("safe_temp_c")
-        try:
-            value = float(saved)
-        except (TypeError, ValueError):
-            return self.cfg.COOLDOWN_SAFE_TEMP_C
-        return value if self._safe_temp_ok(value) else self.cfg.COOLDOWN_SAFE_TEMP_C
+    @property
+    def safe_temp_c(self):
+        """Where post-task cooling ends."""
+        return self.settings.get("safe_temp_c")
 
-    def _safe_temp_ok(self, value):
-        return (_number(value)
-                and self.cfg.COOLDOWN_SAFE_TEMP_MIN_C <= value <= self.cfg.COOLDOWN_SAFE_TEMP_MAX_C)
+    @property
+    def heater_cutoff_c(self):
+        return self.settings.get("heater_cutoff_c")
 
     # ---------------- queries ----------------
     def busy(self):
@@ -237,20 +236,17 @@ class TaskManager:
                 self._tick_cooling(now)
 
     def set_safe_temp(self, value):
-        """Apply the safe shutdown temperature from the web app. Invalid values are ignored."""
+        """Apply the cooldown temperature on its own. Invalid values are ignored."""
         with self.lock:
-            if not self._safe_temp_ok(value):
-                self.store.log_event("settings_rejected", f"safe temperature {value!r} out of range",
-                                     data={"safe_temp_c": value if _number(value) else None})
+            if not self.settings.valid("safe_temp_c", value):
+                self.settings.apply({"safe_temp_c": value})  # logs the rejection
                 return False
-            value = float(value)
-            if value == self.safe_temp_c:
-                return True
-            self.safe_temp_c = value
-            self.store.set_meta(safe_temp_c=value)
-            self.store.log_event("settings_applied", f"safe shutdown temperature {value:.1f} C",
-                                 data={"safe_temp_c": value})
+            self.settings.apply({"safe_temp_c": value})
             return True
+
+    def apply_settings(self, payload):
+        with self.lock:
+            return self.settings.apply(payload)
 
     def _begin_cooling(self, now):
         """Heater off, fan on until the measured temperature is safe. No-op if already safe."""
@@ -293,9 +289,11 @@ class TaskManager:
             return self._end("failed", "over_temperature", now,
                              {"temp_c": temp, "temp_max_c": self.cfg.TEMP_MAX_C})
 
-        # thermostat, never heat without airflow
+        # thermostat, never heat without airflow. The cut-off only pauses heating: the timer,
+        # checkpoints and fan carry on, and the fault checks above stay independent of it.
         self.out.fan.on()
-        if temp >= self.cfg.TASK_SETPOINT_C:
+        cut = self.cutoff.update(temp, self.heater_cutoff_c)
+        if cut or temp >= self.cfg.TASK_SETPOINT_C:
             self.out.heater.off()
         elif temp <= self.cfg.TASK_SETPOINT_C - self.cfg.TASK_HYSTERESIS_C and self.out.fan.is_active:
             self.out.heater.on()

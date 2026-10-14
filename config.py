@@ -20,8 +20,22 @@ TEMP_MAX_C = 60.0               # heater hard cutoff, CHANGE TO YOUR LIMIT
 TEMP_RESUME_DROP = 5.0          # heater can be re-enabled once this far below max
 
 # ---------------- manual mode (commands/fan, commands/heater) ----------------
-HEATER_MAX_SECONDS = 600        # manual heater auto-off
-OFFLINE_FAILSAFE_SECONDS = 120  # manual heater only: no successful sync this long -> off
+# commands/heater=true enables manual heating; the Pi then holds the target with hysteresis,
+# with or without internet. The saved targets live in local storage (see machine_settings.py).
+MANUAL_TARGET_TEMP_C = 47.0     # defaults, used until valid saved values exist
+MANUAL_TARGET_TEMP_MIN_C = 30.0  # mirrors database.rules.json
+MANUAL_TARGET_TEMP_MAX_C = 55.0
+MANUAL_HYSTERESIS_C = 2.0       # manual heater back on at target - hysteresis
+MANUAL_TARGET_HUMIDITY = 60.0   # stored and reported only, there is no humidity sensor
+MANUAL_TARGET_HUMIDITY_MIN = 20.0
+MANUAL_TARGET_HUMIDITY_MAX = 80.0
+
+# heater cut-off (settings/heater_cutoff_c): heater off at or above it, on again `margin` below it.
+# Applies to manual mode and tasks. TEMP_MAX_C stays the separate hard fault above it.
+HEATER_CUTOFF_C = 58.0          # default, above the task setpoint so tasks behave as before
+HEATER_CUTOFF_MIN_C = 30.0      # mirrors database.rules.json
+HEATER_CUTOFF_MAX_C = 58.0
+HEATER_CUTOFF_MARGIN_C = 3.0    # recovery margin, prevents rapid switching around the limit
 
 # ---------------- drying tasks ----------------
 TASK_SETPOINT_C = TEMP_MAX_C - TEMP_RESUME_DROP  # thermostat target during a task

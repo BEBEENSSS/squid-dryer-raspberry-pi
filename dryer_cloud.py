@@ -39,7 +39,11 @@ def coalesce_commands(items):
 
 
 class ManualControl:
-    """The original commands/fan + commands/heater behaviour, used when no task is active."""
+    """The commands/fan + commands/heater behaviour, used when no task is active.
+
+    commands/heater=true means "manual heating enabled": the Pi then holds the saved target
+    temperature itself, with hysteresis, and keeps doing so offline. The heater cut-off pauses it.
+    """
 
     def __init__(self, out, sensor, store, sync, tm, mono=time.monotonic, cfg=config):
         self.out = out
@@ -49,8 +53,9 @@ class ManualControl:
         self.tm = tm
         self.mono = mono
         self.cfg = cfg
-        self.heater_since = None
-        self.failsafe_tripped = True  # heater blocked until Firebase confirms a fresh command
+        self.enabled = False
+        self.block = None             # why a heater request was refused, for the dashboard
+        self.failsafe_tripped = True  # heater blocked after boot until the operator re-enables it
 
     def _event(self, message):
         print(message)
@@ -60,8 +65,14 @@ class ManualControl:
         self.sync.request_write("commands/heater", False)
 
     def heater_off(self):
-        self.heater_since = None
         self.out.heater.off()
+
+    def _disable(self, reason, block):
+        self.enabled = False
+        self.block = block
+        self.heater_off()
+        self._reset_heater_command()
+        self._event(reason)
 
     def apply(self, want_fan, want_heater):
         """Apply the wanted state from Firebase with the safety rules."""
@@ -76,69 +87,78 @@ class ManualControl:
                 self.sync.request_write("commands/heater", False)
                 self.sync.request_write("commands/fan", False)
             return
-        cfg, fan = self.cfg, self.out.fan
-        reject = None
+        fan = self.out.fan
 
         if want_fan:
             fan.on()
         else:
+            self.enabled = False
             self.heater_off()  # never heat without airflow
             fan.off()
 
-        temp = self.sensor.temp()
+        reject = None
         if not want_heater:
+            self.enabled = False
+            self.block = None
             self.heater_off()
         elif self.failsafe_tripped:
+            self.enabled = False
             self.heater_off()
-            reject = "heater blocked after restart or connection loss, re-enable it"
+            reject, self.block = "heater blocked after restart, re-enable it", "reboot_block"
         elif not fan.is_active:
+            self.enabled = False
             self.heater_off()
-            reject = "heater needs the fan on"
-        elif temp is None:
+            reject, self.block = "heater needs the fan on", "no_fan"
+        elif self.sensor.temp() is None:
+            self.enabled = False
             self.heater_off()
-            reject = "heater blocked, no valid temperature reading"
-        elif temp >= cfg.TEMP_MAX_C - cfg.TEMP_RESUME_DROP:
-            self.heater_off()
-            reject = f"heater blocked, too hot ({temp:.1f} C), let it cool"
-        elif not self.out.heater.is_active:
-            self.out.heater.on()
-            self.heater_since = self.mono()
+            reject, self.block = "heater blocked, no valid temperature reading", "sensor_fault"
+        else:
+            self.enabled = True
+            self.block = None
+            self._regulate()
 
         if reject:
             self._reset_heater_command()
             self._event(reject)
 
-    def tick(self):
-        """Limits, auto-off and offline failsafe for manual heating."""
-        if self.tm.busy() or self.tm.cooling_active():
-            self.heater_since = None
-            return
+    def _regulate(self):
+        """Hold the saved target. Faults come first and switch manual heating off."""
         cfg = self.cfg
+        temp = self.sensor.temp()
+        if temp is None:
+            return self._disable("heater off: temperature sensor failed", "sensor_fault")
+        if temp >= cfg.TEMP_MAX_C:
+            return self._disable(f"heater off: over temperature ({temp:.1f} C)", "over_temperature")
+        if not self.out.fan.is_active:
+            return self._disable("heater off: fan is not running", "no_fan")
 
-        # first contact / reconnect: clear any stale heater command before it can apply
+        settings = self.tm.settings
+        cut = self.tm.cutoff.update(temp, settings.get("heater_cutoff_c"))
+        target = settings.get("manual_target_temp_c")
+        if cut or temp >= target:
+            self.heater_off()
+        elif temp <= target - cfg.MANUAL_HYSTERESIS_C and not self.out.heater.is_active:
+            self.out.heater.on()
+
+    def tick(self):
+        """Faults, reboot block and thermostat for manual heating."""
+        if self.tm.busy() or self.tm.cooling_active():
+            self.enabled = False
+            return
+
+        # first contact after boot: clear any stale heater command before it can apply
         if self.failsafe_tripped and self.sync.online:
             self._reset_heater_command()
             self.failsafe_tripped = False
             self._event("connection ok, manual heater stays off until re-enabled")
 
-        if not self.out.heater.is_active:
-            return
-        temp = self.sensor.temp()
-        since_ok = self.sync.seconds_since_ok()
-        if temp is None:
-            reason = "heater off: temperature sensor failed"
-        elif temp >= cfg.TEMP_MAX_C:
-            reason = f"heater off: over temperature ({temp:.1f} C)"
-        elif self.heater_since is not None and self.mono() - self.heater_since >= cfg.HEATER_MAX_SECONDS:
-            reason = "heater auto-off: max runtime reached"
-        elif since_ok is None or since_ok > cfg.OFFLINE_FAILSAFE_SECONDS:
-            self.failsafe_tripped = True
-            reason = "FAILSAFE: Firebase unreachable, manual heater off"
-        else:
-            return
-        self.heater_off()
-        self._reset_heater_command()
-        self._event(reason)
+        if self.enabled:
+            self._regulate()
+        elif self.out.heater.is_active:
+            self.heater_off()  # nothing asked for heat, so nothing may be heating
+        # keep the cut-off latch current while idle so the dashboard shows the real condition
+        self.tm.cutoff.update(self.sensor.temp(), self.tm.settings.get("heater_cutoff_c"))
 
 
 def main():
@@ -168,6 +188,16 @@ def main():
 
     tm = TaskManager(store, out, sensor, boot_id, clock_synced, on_task_start=on_task_start)
 
+    def heater_block(ok):
+        """The active safety condition keeping the heater off, or None (None removes the key)."""
+        if not ok:
+            return "sensor_fault"
+        if sensor.temp_c >= config.TEMP_MAX_C:
+            return "over_temperature"
+        if tm.cutoff.active:
+            return "cutoff"
+        return manual.block
+
     def status():
         ok = sensor.ok()
         machine = tm.machine_status()
@@ -182,6 +212,13 @@ def main():
             "status": machine,
             "cooling": tm.cooling_active(),
             "safe_temp": tm.safe_temp_c,
+            "heater_cutoff": tm.heater_cutoff_c,
+            "heater_cutoff_margin": config.HEATER_CUTOFF_MARGIN_C,
+            "target_temp": tm.settings.get("manual_target_temp_c"),
+            "target_humidity": tm.settings.get("manual_target_humidity"),
+            "settings_updated_at": tm.settings.updated_at,
+            "manual_heating": manual.enabled,
+            "heater_block": heater_block(ok),
             "ready": machine in ("ready", "cooling") and cool_enough and not out.heater.is_active,
         }
 
@@ -226,7 +263,7 @@ def main():
                     if ack:
                         print("command:", ack)
                 elif kind == "settings":
-                    tm.set_safe_temp(payload)
+                    tm.apply_settings(payload)
                 else:
                     manual.apply(*payload)
 
