@@ -1,0 +1,26 @@
+[Unit]
+Description=Squid dryer controller
+# No network-online.target on purpose: the machine must control itself with no network.
+After=local-fs.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=bensdev
+SupplementaryGroups=gpio
+WorkingDirectory=/home/bensdev/squid-dryer
+Environment=PYTHONUNBUFFERED=1
+# Drive both active-low relay pins high (relays off) before and after the process, including after
+# a crash or watchdog kill, when gpiozero has already released the pins. "+" runs it as root.
+ExecStartPre=+/usr/bin/pinctrl set 17,27 op dh
+ExecStart=/home/bensdev/squid-dryer/.venv/bin/python dryer_cloud.py
+ExecStopPost=+/usr/bin/pinctrl set 17,27 op dh
+Restart=always
+RestartSec=2
+WatchdogSec=15
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

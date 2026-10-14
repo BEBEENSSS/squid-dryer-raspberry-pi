@@ -394,6 +394,9 @@ class TaskManager:
         # thermostat, never heat without airflow. The cut-off only pauses heating: the timer,
         # checkpoints and fan carry on, and the fault checks above stay independent of it.
         self.out.fan.on()
+        if self.out.heater.latched:  # runtime guard: stays failed until the operator acknowledges
+            self._end("failed", self.out.heater.latched, now, {"temp_c": temp})
+            return False
         cut = self.cutoff.update(temp, self.heater_cutoff_c)
         if cut or temp >= t["target_c"]:
             self.out.heater.off()
@@ -696,6 +699,8 @@ class TaskManager:
             raise Rejected("unacknowledged_failure")
         if self.out.heater.is_active:
             raise Rejected("heater_in_use")
+        if self.out.heater.latched:
+            raise Rejected("heater_fault")
         temp = self.sensor.temp()
         if temp is None:
             raise Rejected("sensor_unavailable")
@@ -846,6 +851,7 @@ class TaskManager:
             raise Rejected("nothing_to_acknowledge")
         if task_id is not None and task_id != failed["task_id"]:
             raise Rejected("task_mismatch")
+        self.out.heater.clear_latch()
         self.store.update_task(failed["task_id"], acknowledged=1,
                                event=("task_acknowledged", "failure acknowledged",
                                       {"command_id": cmd["command_id"]}))

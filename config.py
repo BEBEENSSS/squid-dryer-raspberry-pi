@@ -19,6 +19,13 @@ SENSOR_STALE_SECONDS = 10       # no good read for this long -> sensor failed
 TEMP_MAX_C = 60.0               # heater hard cutoff, CHANGE TO YOUR LIMIT
 TEMP_RESUME_DROP = 5.0          # heater can be re-enabled once this far below max
 
+# ---------------- heater runtime guard (heater_guard.py) ----------------
+# Tune against a measured cold warm-up: the continuous cap must be longer than the longest real
+# uninterrupted heating period, or a slow cold start will trip it.
+HEATER_MAX_CONTINUOUS_SECONDS = 45 * 60  # relay on without one off for this long -> latched off
+HEATER_RISE_CHECK_SECONDS = 10 * 60      # on this long without HEATER_MIN_RISE_C of warming -> latched off
+HEATER_MIN_RISE_C = 2.0
+
 # ---------------- manual mode (commands/fan, commands/heater) ----------------
 # commands/heater=true enables manual heating; the Pi then holds the target with hysteresis,
 # with or without internet. The saved targets live in local storage (see machine_settings.py).

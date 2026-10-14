@@ -5,6 +5,7 @@ from pathlib import Path
 from gpiozero import OutputDevice
 
 import config
+from heater_guard import HeaterGuard
 
 
 def read_temp(sensor_dir=None):
@@ -68,12 +69,74 @@ class Sensor:
         return self.temp_c if self.ok() else None
 
 
+class SafeHeater:
+    """The heater relay behind the last line of defence, used by tasks and manual mode alike.
+
+    on() refuses without airflow, while the guard is latched, or when a sensor is attached and has
+    no valid reading. check() runs every control tick and cuts the relay when the guard latches.
+    """
+
+    def __init__(self, device, fan, guard=None, mono=time.monotonic):
+        self._dev = device
+        self._fan = fan
+        self.guard = guard or HeaterGuard()
+        self._mono = mono
+        self.temp_fn = None  # set by Outputs.attach_sensor
+
+    @property
+    def latched(self):
+        return self.guard.latched
+
+    @property
+    def is_active(self):
+        return self._dev.is_active
+
+    @property
+    def closed(self):
+        return self._dev.closed
+
+    def on(self):
+        if self.guard.latched or not self._fan.is_active:
+            self._dev.off()
+            return False
+        if self.temp_fn is not None and self.temp_fn() is None:
+            self._dev.off()
+            return False
+        self._dev.on()
+        return True
+
+    def off(self):
+        self._dev.off()
+
+    def check(self):
+        """Returns the reason if this call latched a fault. The relay is already off by then."""
+        if not self._fan.is_active:
+            self._dev.off()  # airflow lost: the heater must not stay on, whoever asked for it
+        temp = self.temp_fn() if self.temp_fn is not None else None
+        if self.temp_fn is not None and temp is None:
+            self._dev.off()
+        reason = self.guard.update(self._dev.is_active, temp, self._mono())
+        if reason:
+            self._dev.off()
+        return reason
+
+    def clear_latch(self):
+        self.guard.clear()
+
+    def close(self):
+        self._dev.close()
+
+
 class Outputs:
     """Fan and heater relays (active low, both off at init)."""
 
-    def __init__(self):
+    def __init__(self, mono=time.monotonic):
         self.fan = OutputDevice(config.FAN_PIN, active_high=False, initial_value=False)
-        self.heater = OutputDevice(config.HEATER_PIN, active_high=False, initial_value=False)
+        self.heater = SafeHeater(
+            OutputDevice(config.HEATER_PIN, active_high=False, initial_value=False), self.fan, mono=mono)
+
+    def attach_sensor(self, sensor):
+        self.heater.temp_fn = sensor.temp
 
     def all_off(self):
         self.heater.off()

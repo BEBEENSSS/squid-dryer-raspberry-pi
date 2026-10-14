@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 
 import config
+import sd_notify
 from cloud_sync import CloudSync
 from hardware import Outputs, Sensor
 from task_manager import TaskManager
@@ -56,6 +57,7 @@ class ManualControl:
         self.enabled = False
         self.block = None             # why a heater request was refused, for the dashboard
         self.failsafe_tripped = True  # heater blocked after boot until the operator re-enables it
+        self._latch_seen_off = False
 
     def _event(self, message):
         print(message)
@@ -76,6 +78,14 @@ class ManualControl:
 
     def apply(self, want_fan, want_heater):
         """Apply the wanted state from Firebase with the safety rules."""
+        if self.out.heater.latched is None:
+            self._latch_seen_off = False
+        elif not want_heater:
+            self._latch_seen_off = True
+        elif self._latch_seen_off:
+            # the operator switched heating off and on again after the fault: that clears it
+            self.out.heater.clear_latch()
+            self.block = None
         if self.tm.busy():
             if want_fan or want_heater:
                 self._event("manual command ignored: drying task active")
@@ -132,6 +142,8 @@ class ManualControl:
             return self._disable(f"heater off: over temperature ({temp:.1f} C)", "over_temperature")
         if not self.out.fan.is_active:
             return self._disable("heater off: fan is not running", "no_fan")
+        if self.out.heater.latched:
+            return self._disable(f"heater off: {self.out.heater.latched}", self.out.heater.latched)
 
         settings = self.tm.settings
         cut = self.tm.cutoff.update(temp, settings.get("heater_cutoff_c"))
@@ -168,6 +180,7 @@ def main():
 
     out = Outputs()  # both relays off before anything else happens
     sensor = Sensor()
+    out.attach_sensor(sensor)
     boot_id = read_boot_id()
 
     def open_store():
@@ -194,6 +207,8 @@ def main():
             return "sensor_fault"
         if sensor.temp_c >= config.TEMP_MAX_C:
             return "over_temperature"
+        if out.heater.latched:
+            return out.heater.latched
         if tm.cutoff.active:
             return "cutoff"
         return manual.block
@@ -241,6 +256,7 @@ def main():
     threading.Thread(target=read_sensor, daemon=True, name="sensor").start()
     threading.Thread(target=sync.run, args=(stop,), daemon=True, name="cloud-sync").start()
     print("Running. Control it from Firebase.")
+    sd_notify.ready()
 
     try:
         next_tick = time.monotonic()
@@ -269,6 +285,10 @@ def main():
 
             now = time.monotonic()
             if now >= next_tick:
+                sd_notify.watchdog()  # only a loop that is still ticking keeps systemd satisfied
+                latched = out.heater.check()
+                if latched:
+                    store.log_event("heater_guard", f"heater latched off: {latched}")
                 tm.tick()
                 manual.tick()
                 next_tick = now + config.LOOP_INTERVAL
