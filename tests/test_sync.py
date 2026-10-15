@@ -314,16 +314,16 @@ def test_listener_wakes_sync_and_failure_falls_back_to_polling(rig):
     sync, q = make_sync(rig, StreamBase())
     sync._wake.clear()
     assert sync.sync_once()
-    assert len(callbacks) == 2 and len(sync._listeners) == 2
+    assert len(callbacks) == 3 and len(sync._listeners) == 3
     sync._wake.clear()
     callbacks[0]({"event": "put"})
     assert sync._wake.is_set()
     sync._base.fail = True
     assert not sync.sync_once()
-    assert len(closed) == 2 and sync._listeners == []  # reopened after reconnect
+    assert len(closed) == 3 and sync._listeners == []  # reopened after reconnect
     sync._base.fail = False
     assert sync.sync_once()
-    assert len(sync._listeners) == 2
+    assert len(sync._listeners) == 3
 
 
 def test_coalesce_keeps_task_order_and_only_the_latest_manual():

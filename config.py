@@ -134,5 +134,13 @@ NET_WIFI_DROP_GRACE_SECONDS = _env("NET_WIFI_DROP_GRACE_SECONDS", 60, float)  # 
 NET_POLL_SECONDS = _env("NET_POLL_SECONDS", 5, float)
 NET_ASSIST_SECONDS = _env("NET_ASSIST_SECONDS", 30, float)  # while waiting for the router, ask for Wi-Fi this often
 NET_ASSIST_TIMEOUT_SECONDS = _env("NET_ASSIST_TIMEOUT_SECONDS", 20, float)
+# A hotspot an operator asked for from the web app or the local panel (see net_policy.request_hotspot).
+NET_HOTSPOT_CONNECT_TIMEOUT_SECONDS = _env("NET_HOTSPOT_CONNECT_TIMEOUT_SECONDS", 300, float)  # nobody joined: back to Wi-Fi
+NET_HOTSPOT_EMPTY_GRACE_SECONDS = _env("NET_HOTSPOT_EMPTY_GRACE_SECONDS", 60, float)  # last phone left: back to Wi-Fi
+NET_WIFI_MAX_PROFILES = _env("NET_WIFI_MAX_PROFILES", 5, int)  # saved networks tried per probe, home profile first
+NET_SWITCH_DELAY_SECONDS = _env("NET_SWITCH_DELAY_SECONDS", 5, float)  # lets the ack reach Firebase before the radio switches
+NET_REQUEST_MAX_AGE_SECONDS = _env("NET_REQUEST_MAX_AGE_SECONDS", 60, float)  # an older request file is never acted on
+# Written by the controller (bensdev), read by netwatch (root); not under /run/squid-dryer, which root owns.
+NET_REQUEST_PATH = Path(_env("NET_REQUEST_PATH", "/home/bensdev/squid-dryer/data/network-request.json"))
 NET_STATUS_PATH = Path(_env("NET_STATUS_PATH", "/run/squid-dryer/network.json"))
 NET_STATUS_MAX_AGE_SECONDS = 30  # an older status file means netwatch is not running

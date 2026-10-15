@@ -2,10 +2,12 @@ from net_policy import (BOOT_WAIT, HOTSPOT, NONE, PROBE_WIFI, PROBING, START_HOT
                         NetPolicy)
 
 GRACE, RETRY, DROP = 180, 120, 60
+CONNECT, EMPTY = 300, 60  # a requested hotspot: wait for a phone, then for the last phone to leave
 
 
 def policy(uptime=0, log=None):
-    return NetPolicy(0.0, uptime, boot_grace=GRACE, retry_interval=RETRY, drop_grace=DROP, log=log)
+    return NetPolicy(0.0, uptime, boot_grace=GRACE, retry_interval=RETRY, drop_grace=DROP,
+                     connect_timeout=CONNECT, empty_grace=EMPTY, log=log)
 
 
 def step(p, t, wifi=False, hotspot=False, clients=0):
@@ -146,3 +148,120 @@ def test_every_transition_is_logged_once():
     assert len(lines) == 2
     assert "boot_wait -> wifi" in lines[0]
     assert "wifi -> wifi_lost" in lines[1]
+
+
+# ---------------- a hotspot an operator asked for ----------------
+
+def requested_hotspot(t=1000):
+    """On Wi-Fi, then asked for the hotspot at t, which comes up a moment later."""
+    p = policy()
+    step(p, 5, wifi=True)
+    assert p.request_hotspot(t) == START_HOTSPOT
+    assert p.state == HOTSPOT and p.requested and p.reason == "requested"
+    assert step(p, t + 1, hotspot=True) == NONE
+    return p, t
+
+
+def test_requested_hotspot_gives_up_when_nobody_joins_within_the_connect_timeout():
+    p, t = requested_hotspot()
+    assert step(p, t + CONNECT - 1, hotspot=True) == NONE
+    assert step(p, t + CONNECT, hotspot=True) == PROBE_WIFI
+    assert p.reason == "requested" and p.state == PROBING
+    p.probe_done(t + CONNECT + 10, joined=True)
+    assert p.state == WIFI and p.reason == "no_client_timeout"
+
+
+def test_requested_hotspot_stays_up_for_as_long_as_a_phone_is_connected():
+    p, t = requested_hotspot()
+    for now in range(t + 2, t + 7200, 5):
+        assert step(p, now, hotspot=True, clients=1) == NONE
+    assert p.state == HOTSPOT
+
+
+def test_requested_hotspot_returns_to_wifi_a_short_grace_after_the_last_phone_left():
+    p, t = requested_hotspot()
+    assert step(p, t + 100, hotspot=True, clients=1) == NONE
+    assert step(p, t + 100 + EMPTY - 1, hotspot=True, clients=0) == NONE
+    assert step(p, t + 100 + EMPTY, hotspot=True, clients=0) == PROBE_WIFI
+    p.probe_done(t + 100 + EMPTY + 10, joined=True)
+    assert p.state == WIFI and p.reason == "clients_left"
+
+
+def test_a_phone_that_comes_back_inside_the_grace_keeps_the_requested_hotspot():
+    p, t = requested_hotspot()
+    step(p, t + 10, hotspot=True, clients=1)
+    assert step(p, t + 10 + EMPTY - 5, hotspot=True, clients=0) == NONE
+    assert step(p, t + 10 + EMPTY - 1, hotspot=True, clients=1) == NONE
+    assert step(p, t + 10 + 2 * EMPTY - 2, hotspot=True, clients=0) == NONE
+    assert p.state == HOTSPOT
+
+
+def test_unreadable_client_count_keeps_a_requested_hotspot_up():
+    p, t = requested_hotspot()
+    for now in range(t + 2, t + 3 * CONNECT, 5):
+        assert step(p, now, hotspot=True, clients=None) == NONE
+
+
+def test_failed_return_to_wifi_leaves_the_fallback_hotspot_and_retries_on_the_slow_interval():
+    p, t = requested_hotspot()
+    assert step(p, t + CONNECT, hotspot=True) == PROBE_WIFI
+    p.probe_done(t + CONNECT + 40, joined=False)
+    assert p.state == HOTSPOT and not p.requested and p.reason == "fallback"
+    assert step(p, t + CONNECT + 41) == START_HOTSPOT
+    assert step(p, t + CONNECT + 42, hotspot=True) == NONE
+    # the short requested-hotspot timers no longer apply: a full retry interval is waited out
+    assert step(p, t + CONNECT + 40 + EMPTY + 1, hotspot=True) == NONE
+    assert step(p, t + CONNECT + 40 + RETRY, hotspot=True) == PROBE_WIFI
+
+
+def test_requested_hotspot_that_never_comes_up_gives_up_too():
+    p = policy()
+    step(p, 5, wifi=True)
+    assert p.request_hotspot(1000) == START_HOTSPOT
+    assert step(p, 1005, hotspot=False) == NONE
+    assert step(p, 1010, hotspot=False) == START_HOTSPOT  # asked again every 10 s
+    assert step(p, 1000 + CONNECT, hotspot=False) == PROBE_WIFI
+
+
+def test_wifi_still_connected_does_not_cancel_a_requested_hotspot_that_has_not_started():
+    p = policy()
+    step(p, 5, wifi=True)
+    p.request_hotspot(1000)
+    assert step(p, 1010, wifi=True) == START_HOTSPOT
+    assert p.state == HOTSPOT and p.requested
+
+
+def test_switching_back_to_wifi_on_request_probes_at_once_even_with_a_phone_connected():
+    p, t = requested_hotspot()
+    step(p, t + 10, hotspot=True, clients=2)
+    assert p.request_wifi(t + 11) == PROBE_WIFI
+    assert p.state == PROBING
+    p.probe_done(t + 30, joined=True)
+    assert p.state == WIFI and p.reason == "switched_back"
+
+
+def test_asking_for_wifi_while_already_on_wifi_does_nothing():
+    p = policy()
+    step(p, 5, wifi=True)
+    assert p.request_wifi(10) == NONE
+    assert p.state == WIFI
+
+
+def test_asking_for_the_hotspot_while_the_fallback_hotspot_is_up_only_changes_the_rules():
+    p = policy()
+    t = raise_hotspot(p)
+    assert p.request_hotspot(t + 10) == NONE  # the radio is left alone, no phone is kicked
+    assert p.requested
+    assert step(p, t + 10 + CONNECT - 1, hotspot=True) == NONE
+    assert step(p, t + 10 + CONNECT, hotspot=True) == PROBE_WIFI
+
+
+def test_the_reason_explains_how_a_wifi_connection_came_about():
+    p = policy()
+    assert p.reason == "boot"
+    step(p, 5, wifi=True)
+    assert p.reason == "boot"
+    step(p, 100, wifi=False)
+    step(p, 100 + DROP)
+    p.probe_done(200, joined=True)
+    assert p.reason == "wifi_back"

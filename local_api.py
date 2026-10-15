@@ -27,6 +27,7 @@ from urllib.parse import unquote, urlsplit
 
 import config
 import machine_settings
+from network_control import parse_network_request
 
 SESSION_COOKIE = "sd_session"
 SESSION_SECONDS = 12 * 3600
@@ -293,7 +294,7 @@ class LocalApi:
                     api.auth.logout(self._token())
                     return self._json(200, {"authenticated": False},
                                       {"Set-Cookie": f"{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"})
-                if path in ("/api/commands", "/api/settings", "/api/task/request"):
+                if path in ("/api/commands", "/api/settings", "/api/task/request", "/api/network/request"):
                     if not self._authed():
                         return self._json(401, {"error": "login_required"})
                     body = self._body()
@@ -313,6 +314,13 @@ class LocalApi:
                         api._mark_local()
                         api.commands.put(("settings_local", parsed))
                         return self._json(202, {"ok": True})
+                    if path == "/api/network/request":
+                        # not a machine command, so it does not outrank older cloud commands
+                        parsed, err = parse_network_request(body)
+                        if err:
+                            return self._json(400, {"error": err})
+                        api.commands.put(("network_local", parsed))
+                        return self._json(202, {"command_id": parsed["command_id"]})
                     parsed, err = parse_task_request(body)
                     if err:
                         return self._json(400, {"error": err})

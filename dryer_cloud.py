@@ -18,6 +18,7 @@ from command_age import LocalCommandMark  # noqa: E402
 from hardware import Outputs, Sensor  # noqa: E402
 from local_api import LocalApi  # noqa: E402
 from netinfo import lan_ip, read_network_status  # noqa: E402
+from network_control import NetworkControl, network_ack_payload  # noqa: E402
 from snapshot import build_snapshot  # noqa: E402
 from task_manager import TaskManager  # noqa: E402
 from task_store import TaskStore  # noqa: E402
@@ -242,9 +243,13 @@ def main():
             return "cutoff"
         return manual.block
 
+    def network_status():
+        return read_network_status(config.NET_STATUS_PATH, config.NET_STATUS_MAX_AGE_SECONDS)
+
     def status():
         ok = sensor.ok()
         machine = tm.machine_status()
+        net = network_status() or {}  # empty when netwatch is not running: the keys are then removed
         # a new task may start while cooling once the machine is cool enough to accept it
         cool_enough = ok and sensor.temp_c < config.TEMP_MAX_C - config.TEMP_RESUME_DROP
         return {
@@ -269,11 +274,19 @@ def main():
             "command_at": manual.last_command_at,
             "clock_synced": bool(clock_synced()),
             "local_url": f"http://{ip}:{config.LOCAL_API_PORT}" if (ip := lan_ip()) else None,
+            # which network the machine is on and why; only the Wi-Fi side of this ever reaches Firebase
+            "network": net.get("network"),
+            "network_since": int(net["since"] * 1000) if isinstance(net.get("since"), (int, float)) else None,
+            "network_reason": net.get("reason"),
+            "hotspot_connect_timeout_s": net.get("connect_timeout_s"),
+            "hotspot_empty_grace_s": net.get("empty_grace_s"),
         }
 
     local_mark = LocalCommandMark()  # the operator at the machine outranks older requests from the cloud
     tm.local_mark = local_mark
-    sync = CloudSync(open_store, tm, status, commands, boot_id, local_mark=local_mark)
+    netctl = NetworkControl(now_ms=lambda: now_ms())  # now_ms is defined below, before it is first called
+    sync = CloudSync(open_store, tm, status, commands, boot_id, local_mark=local_mark,
+                     network_ack_fn=lambda: network_ack_payload(netctl.last_ack))
     snapshot = {"value": None}   # swapped whole by the control loop, read by the HTTP thread
     task_request = {"value": None}  # newest task request seen from either panel
     last_tick = {"at": time.monotonic()}
@@ -288,7 +301,7 @@ def main():
             state=status(), manual=dict(manual.wanted), settings=tm.settings, request=task_request["value"],
             report=tm.snapshot(), ack=store.last_command(), pi_now_ms=now_ms(),
             cloud_online=sync.online, loop_age_s=time.monotonic() - last_tick["at"],
-            wifi=read_network_status(config.NET_STATUS_PATH, config.NET_STATUS_MAX_AGE_SECONDS))
+            wifi=network_status(), network_ack=network_ack_payload(netctl.last_ack))
     manual = ManualControl(out, sensor, store, sync, tm)
     tm.server_now_ms = sync.server_clock.now_ms  # command age is judged on server time, not the Pi clock
 
@@ -345,6 +358,15 @@ def main():
                     ack = tm.handle_command(payload)
                     if ack:
                         print("command:", ack)
+                elif kind in ("network", "network_local"):
+                    # only the request file changes: the relays and the drying task are not touched
+                    request, verdict = (payload["request"], payload["verdict"]) if kind == "network" else (payload, None)
+                    ack = netctl.handle(request, verdict)
+                    if ack:
+                        print("network:", ack)
+                        store.log_event("network_request", f"switch to {ack['mode']} {ack['result']}",
+                                        data={"command_id": ack["command_id"], "reason": ack["reason"],
+                                              "source": "online" if kind == "network" else "local"})
                 elif kind == "settings":
                     tm.apply_settings(payload)
                 elif kind == "settings_local":

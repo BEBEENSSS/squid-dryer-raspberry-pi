@@ -15,6 +15,7 @@ def make_cfg(tmp_path):
     values = {k: getattr(config, k) for k in dir(config) if k.startswith("NET_")}
     values["NET_HOTSPOT_PSK_PATH"] = tmp_path / "hotspot_psk"
     values["NET_STATUS_PATH"] = tmp_path / "network.json"
+    values["NET_REQUEST_PATH"] = tmp_path / "network-request.json"
     return SimpleNamespace(**values)
 
 
@@ -27,6 +28,7 @@ class FakeNmcli:
         self.router_on = router_on
         self.clients = 0
         self.calls = []
+        self.reachable = set()  # other saved networks that are in range
 
     def __call__(self, argv, **kwargs):
         self.calls.append((argv, kwargs))
@@ -45,6 +47,9 @@ class FakeNmcli:
             args = args[2:]
         if args[:3] == ["-t", "-f", "DEVICE,STATE"]:
             return "lo:unmanaged\nwlan0:connected", 0
+        if args[:3] == ["-t", "-f", "NAME,TYPE"]:
+            names = [n for n in self.profiles if "--active" not in args or n in self.active]
+            return "\n".join(n.replace(":", "\\:") + ":802-11-wireless" for n in names), 0
         silent = args[0] == "-s"
         if silent:
             args = args[1:]
@@ -72,6 +77,8 @@ class FakeNmcli:
             name = args[3]
             if name == HOME and not self.router_on:
                 return "", 4
+            if name not in (HOME, HOTSPOT) and name not in self.reachable:
+                return "", 4
             self.active = {name}  # one radio: joining one network leaves the other
             return "", 0
         if verb == "down":
@@ -87,7 +94,9 @@ def make_watch(tmp_path, router_on=True, uptime=0.0):
     clock = SimpleNamespace(t=0.0)
     policy = NetPolicy(0.0, uptime, boot_grace=cfg.NET_BOOT_GRACE_SECONDS,
                        retry_interval=cfg.NET_RETRY_INTERVAL_SECONDS,
-                       drop_grace=cfg.NET_WIFI_DROP_GRACE_SECONDS)
+                       drop_grace=cfg.NET_WIFI_DROP_GRACE_SECONDS,
+                       connect_timeout=cfg.NET_HOTSPOT_CONNECT_TIMEOUT_SECONDS,
+                       empty_grace=cfg.NET_HOTSPOT_EMPTY_GRACE_SECONDS)
     written = []
     watch = netwatch.Netwatch(netwatch.Nm(cfg, run=fake), policy, cfg, mono=lambda: clock.t,
                               wall=lambda: 1_800_000_000 + clock.t,
@@ -254,8 +263,8 @@ def test_scenario_wifi_dropping_leads_to_the_hotspot_only_after_the_grace_and_a_
 def test_status_file_is_read_back_by_the_controller_and_ignored_when_stale(tmp_path):
     path = tmp_path / "network.json"
     netwatch.write_status(path, {"network": "hotspot", "clients": 1, "address": "10.42.0.1", "updated_at": 1000.0})
-    assert read_network_status(path, 30, wall=lambda: 1010.0) == {
-        "network": "hotspot", "clients": 1, "address": "10.42.0.1"}
+    status = read_network_status(path, 30, wall=lambda: 1010.0)
+    assert (status["network"], status["clients"], status["address"]) == ("hotspot", 1, "10.42.0.1")
     assert read_network_status(path, 30, wall=lambda: 1100.0) is None  # netwatch stopped writing
     assert read_network_status(tmp_path / "missing.json", 30) is None
     path.write_text("{not json")

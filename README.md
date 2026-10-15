@@ -152,6 +152,7 @@ The schema follows the web app. Security rules are in `database.rules.json`. The
 - `weight_kg` is optional.
 - `requested_at` must be the server timestamp. Each request is processed **exactly once**, identified by `command_id` if one is sent, otherwise by `task_id + command + requested_at`. Reading the same request again after a reconnect or reboot does nothing.
 - `commands/fan` and `commands/heater` work as before (manual mode).
+- `network/request`: `{command_id, mode: "hotspot"|"wifi", requested_at, issued_at, requested_by}` asks the Pi to raise its own hotspot (`hotspot`) or to go back to the home Wi-Fi (`wifi`). `requested_at` must be the server timestamp and `issued_at` is the client's server-corrected time. Aged like a manual command (30 s, and not before a local command). Answered once per `command_id` through `network/ack`. See "Hotspot mode on request" below.
 
 **The Pi writes** (the web app only reads these):
 
@@ -167,6 +168,9 @@ The schema follows the web app. Security rules are in `database.rules.json`. The
   - `seq` increases with every change.
 - `state/status`: `ready`, `starting`, `warming_up`, `running`, `cooling`, `recovering`, `recovery_required` or `failed` (a failure not yet acknowledged). `state/ready` is true when a new task can be started.
 - `state/fan`, `heater`, `temp`, `sensor_ok`, `temp_max`, `last_event`, `boot_id`, `pending_events` (events still waiting to upload)
+- `network/ack`: `{command_id, mode, result: accepted|rejected, reason, at}`. `accepted` means the request was handed to netwatch, **not** that the radio has switched: the switch starts `NET_SWITCH_DELAY_SECONDS` later, and when the Pi leaves the home Wi-Fi it can no longer report anything. `reason` for a rejection: `stale_command`, `superseded_by_local`, `unverifiable` (the Pi could not prove the request was recent), `already_in_mode`, `netwatch_unavailable`, `write_failed` or `invalid`.
+- `state/network`: `wifi`, `hotspot` or `connecting`, as last reported by netwatch (removed when netwatch is not running). While the Pi is on its hotspot it has no route to Firebase, so `hotspot` is only ever seen locally; the cloud sees `last_seen` stop and, later, `wifi` again.
+- `state/network_since` (epoch ms, Pi clock), `state/network_reason` (why the machine is in this mode: `boot`, `requested`, `fallback`, `no_client_timeout`, `clients_left`, `switched_back` or `wifi_back`), `state/hotspot_connect_timeout_s`, `state/hotspot_empty_grace_s`.
 - `state/last_seen`: server timestamp of the last successful write.
 - `events/{0000000001…}`: the local event log in order. Events recorded offline are uploaded after reconnection, and their `at` is the Pi's local time.
 
@@ -208,6 +212,12 @@ All network settings are in the `NET_*` block of `config.py`. Each can also be s
 | `NET_RETRY_INTERVAL_SECONDS` | 120 | an empty hotspot tries the home Wi-Fi this often |
 | `NET_WIFI_TRY_TIMEOUT_SECONDS` | 40 | how long one try at the home Wi-Fi may take |
 | `NET_WIFI_DROP_GRACE_SECONDS` | 60 | a lost Wi-Fi link gets this long to come back before the Pi tries explicitly and then raises the hotspot |
+| `NET_HOTSPOT_CONNECT_TIMEOUT_SECONDS` | 300 | a hotspot an operator asked for gives up and returns to Wi-Fi if no phone has joined within this time |
+| `NET_HOTSPOT_EMPTY_GRACE_SECONDS` | 60 | a requested hotspot that a phone has joined returns to Wi-Fi this long after the last phone left |
+| `NET_WIFI_MAX_PROFILES` | 5 | saved Wi-Fi networks tried per return to Wi-Fi, the home profile first |
+| `NET_SWITCH_DELAY_SECONDS` | 5 | a requested switch starts this long after it was accepted, so the answer can be published first |
+| `NET_REQUEST_MAX_AGE_SECONDS` | 60 | netwatch never acts on a request file older than this (guards against replay after a restart) |
+| `NET_REQUEST_PATH` | `data/network-request.json` | where the controller hands a request to netwatch (written by `bensdev`, read by root) |
 
 ### How it decides
 
@@ -220,6 +230,21 @@ All network settings are in the `NET_*` block of `config.py`. Each can also be s
 - Every transition is logged with a timestamp: `journalctl -u squid-netwatch -f`.
 
 netwatch checks on start that NetworkManager manages `wlan0`, that the home profile exists and that the hotspot password file is valid. If not, it logs why and touches nothing.
+
+### Hotspot mode on request
+
+When the internet is slow or unreliable, an operator can put the machine on its own hotspot on purpose, from the Profile page of the online app (`network/request`, `mode: "hotspot"`) or, to go back, from the local panel (`POST /api/network/request`, PIN session needed). The controller validates and answers the request, then writes it to `NET_REQUEST_PATH`; netwatch, which owns the radio, acts on it. **Nothing in this path touches the relays, the sensor or the drying task**, so a run continues through a switch and through the time spent without internet.
+
+A hotspot that was requested has its own, shorter rules (the automatic fallback hotspot above keeps its own):
+
+- **Nobody joins** within `NET_HOTSPOT_CONNECT_TIMEOUT_SECONDS` → the hotspot is taken down and the Pi returns to Wi-Fi (`network_reason: no_client_timeout`).
+- **A phone joins** → the hotspot stays up for as long as any phone is connected (an unreadable count counts as connected).
+- **The last phone leaves** → after `NET_HOTSPOT_EMPTY_GRACE_SECONDS` the Pi returns to Wi-Fi (`clients_left`).
+- **Returning to Wi-Fi** takes the hotspot down and tries each saved Wi-Fi profile in turn (home profile first, at most `NET_WIFI_MAX_PROFILES`; only networks already saved in NetworkManager, never unknown or open ones). The first that connects wins and cloud control resumes.
+- **No saved network in range** → the Pi is not left without a network: the ordinary fallback hotspot comes back and the usual retry (`NET_RETRY_INTERVAL_SECONDS`) keeps looking for a known network.
+- **Asking for `wifi`** from the hotspot returns to Wi-Fi straight away, even with a phone connected (`switched_back`).
+
+A request is acted on once: netwatch remembers the last `command_id` it handled (also across a restart) and ignores request files older than `NET_REQUEST_MAX_AGE_SECONDS`. A cloud request that is too old or cannot be aged (no server time yet) is refused with `network/ack` `rejected`, so a request left in Firebase from before an outage can never take the machine off its network.
 
 ### Finding the Pi
 
@@ -261,3 +286,7 @@ When the internet comes back, the Pi publishes its current actual state at once 
 9. **Heater cut-off.** With a low `heater_cutoff_c` the heater turns off at that temperature. Unplug the temperature sensor: the heater turns off with `heater_block: sensor_fault`, whatever command is sent from the cloud or the panel.
 10. **Reboot persistence.** After `sudo reboot`, `nmcli connection show squid-hotspot` still exists with `connection.autoconnect: no` and band `bg`, and the home profile still has its original name. (On a netplan system the profile is stored under `/etc/netplan/`; netwatch repairs the hotspot profile on every start if it is missing.)
 11. **Cloud mode unchanged.** Log in to the online app: manual toggles, starting and cancelling a task, and the dashboard all behave as before.
+12. **Hotspot on request, nobody joins.** Start a drying task, then request Hotspot Mode from the online app. The task keeps running, `SquidDryer` appears within about 10 s, and after `NET_HOTSPOT_CONNECT_TIMEOUT_SECONDS` the Pi is back on Wi-Fi with `state/network_reason: no_client_timeout`.
+13. **Hotspot on request, phone joins.** Request it again, join `SquidDryer` and open the panel. The hotspot stays up well past the connect timeout. Disconnect the phone: after `NET_HOTSPOT_EMPTY_GRACE_SECONDS` plus the Wi-Fi try the Pi is back on Wi-Fi (`clients_left`).
+14. **Switch back from the panel.** Request the hotspot, join it, then use the panel's "Switch back to Wi-Fi". The phone loses the hotspot, the Pi joins Wi-Fi (`switched_back`).
+15. **Router off during a requested hotspot.** Switch the router off, request the hotspot and let it time out. The hotspot comes back (`fallback`) instead of the Pi being left without a network, and joins the router when it returns.

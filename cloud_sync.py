@@ -27,7 +27,8 @@ def firebase_base():
 
 class CloudSync:
     def __init__(self, store_factory, tm, status_fn, commands, boot_id,
-                 base_factory=firebase_base, mono=time.monotonic, cfg=config, local_mark=None):
+                 base_factory=firebase_base, mono=time.monotonic, cfg=config, local_mark=None,
+                 network_ack_fn=None):
         self.store_factory = store_factory  # store is opened inside the sync thread
         self.tm = tm
         self.status_fn = status_fn          # dict of live machine state (fan, heater, temp, ...)
@@ -37,6 +38,8 @@ class CloudSync:
         self.mono = mono
         self.cfg = cfg
         self.local_mark = local_mark        # when the local panel was last used (command_age.py)
+        self.network_ack_fn = network_ack_fn  # newest answer to a network/request, or None
+        self._last_network_id = None
 
         self._base = None
         self._store = None
@@ -113,7 +116,7 @@ class CloudSync:
         """
         if self._listeners or not self.cfg.COMMAND_LISTEN:
             return
-        for path in ("commands", "task/request"):
+        for path in ("commands", "task/request", "network/request"):
             try:
                 self._listeners.append(self._base.child(path).listen(lambda _event: self._wake.set()))
             except Exception as e:
@@ -180,6 +183,14 @@ class CloudSync:
             self._last_task_cmd = key
             self.commands.put(("task", request))
 
+        network = self._base.child("network/request").get()
+        network_id = network.get("command_id") if isinstance(network, dict) else None
+        if isinstance(network_id, str) and network_id and network_id != self._last_network_id:
+            self._last_network_id = network_id
+            # aged like a manual command: a request left over from before an outage must not drop the network
+            verdict = self._manual_verdict(network.get("issued_at"))
+            self.commands.put(("network", {"request": network, "verdict": verdict}))
+
         now = self.mono()
         if (self._last_settings_poll is None
                 or now - self._last_settings_poll >= self.cfg.SETTINGS_POLL_SECONDS):
@@ -229,6 +240,9 @@ class CloudSync:
         ack = ack_payload(store.last_command())
         if ack:
             updates["task/ack"] = ack
+        network_ack = self.network_ack_fn() if self.network_ack_fn else None
+        if network_ack:
+            updates["network/ack"] = network_ack
         last = store.last_event()
         if last:
             updates["state/last_event"] = (last["message"] or last["type"])[:200]

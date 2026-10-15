@@ -24,7 +24,7 @@ def settings_payload(settings):
 
 
 def build_snapshot(*, state, manual, settings, request, report, ack, pi_now_ms, cloud_online,
-                   loop_age_s, wifi=None):
+                   loop_age_s, wifi=None, network_ack=None):
     """`state` is the same dict that is published to Firebase `state/*` (None values dropped)."""
     report = dict(report) if report else None
     if report is not None:
@@ -34,6 +34,7 @@ def build_snapshot(*, state, manual, settings, request, report, ack, pi_now_ms, 
         "loop_age_s": round(loop_age_s, 2),
         "cloud_online": bool(cloud_online),
         "wifi": wifi,
+        "network": {"ack": network_ack},
         "state": {k: v for k, v in state.items() if v is not None} | {"last_seen": pi_now_ms},
         "commands": manual,
         "settings": settings_payload(settings),

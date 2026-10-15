@@ -13,6 +13,7 @@ import datetime
 import getpass
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -23,7 +24,6 @@ import config
 import sd_notify
 from net_policy import BOOT_WAIT, PROBE_WIFI, START_HOTSPOT, WIFI_LOST, NetPolicy
 from netinfo import lan_ip
-
 
 def log(message):
     stamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
@@ -56,6 +56,32 @@ class Nm:
 
     def is_active(self, name):
         return self.connection_state(name) == "activated"
+
+    def _wifi_profiles(self, active_only):
+        """Names of Wi-Fi profiles (hotspot excluded). nmcli -t backslash-escapes ':' and backslash in names."""
+        args = ["-t", "-f", "NAME,TYPE", "connection", "show"] + (["--active"] if active_only else [])
+        ok, out = self.nmcli(args, timeout=10)
+        if not ok:
+            return []
+        names = []
+        for line in out.splitlines():
+            raw, _, kind = line.rpartition(":")
+            name = re.sub(r"\\(.)", r"\1", raw)
+            if kind == "802-11-wireless" and name != self.cfg.NET_HOTSPOT_CONNECTION:
+                names.append(name)
+        return names
+
+    def wifi_up(self):
+        """Any saved Wi-Fi network is connected, not only the configured home one."""
+        return bool(self._wifi_profiles(active_only=True))
+
+    def saved_wifi_profiles(self):
+        """Saved client networks to try, the configured home profile first. Never open or unknown networks:
+        only profiles somebody already saved in NetworkManager are used."""
+        home = self.cfg.NET_WIFI_CONNECTION
+        names = [n for n in self._wifi_profiles(active_only=False) if self._get(n, "802-11-wireless.mode") != "ap"]
+        names.sort(key=lambda n: n != home)  # stable: home first, the rest in NetworkManager's order
+        return names[: self.cfg.NET_WIFI_MAX_PROFILES]
 
     def exists(self, name):
         ok, _ = self.nmcli(["-g", "connection.id", "connection", "show", "id", name], timeout=10)
@@ -157,6 +183,28 @@ def write_status(path, payload):
         log(f"could not write {path}: {e}")
 
 
+REQUEST_MODES = ("hotspot", "wifi")
+
+
+def read_request(path):
+    """The operator's pending mode request, or None when missing or malformed. Never raises."""
+    try:
+        data = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("mode") not in REQUEST_MODES:
+        return None
+    if not isinstance(data.get("command_id"), str) or not data["command_id"]:
+        return None
+    if not isinstance(data.get("requested_at"), (int, float)):
+        return None
+    not_before = data.get("not_before", 0)
+    if not isinstance(not_before, (int, float)):
+        return None
+    return {"command_id": data["command_id"], "mode": data["mode"],
+            "requested_at": float(data["requested_at"]), "not_before": float(not_before)}
+
+
 class Netwatch:
     def __init__(self, nm, policy, cfg=config, mono=time.monotonic, wall=time.time,
                  write=write_status, address=lan_ip, ping=sd_notify.watchdog):
@@ -171,6 +219,14 @@ class Netwatch:
         self._assisted_at = None
         self._network = None
         self._since = wall()
+        self._handled = self._last_handled()
+
+    def _last_handled(self):
+        """The request id handled before a restart, so a restart cannot replay it."""
+        try:
+            return json.loads(Path(self.cfg.NET_STATUS_PATH).read_text()).get("handled_request_id")
+        except (OSError, ValueError, AttributeError):
+            return None
 
     def preflight(self):
         """Why netwatch cannot work yet, or None. Until it can, it touches nothing."""
@@ -187,14 +243,19 @@ class Netwatch:
         return None
 
     def _probe(self):
-        """Hotspot down, home Wi-Fi up. True if the home Wi-Fi was joined."""
+        """Hotspot down, then each saved Wi-Fi network in turn. True if one was joined."""
         cfg = self.cfg
         if self.nm.is_active(cfg.NET_HOTSPOT_CONNECTION):
             self.nm.down(cfg.NET_HOTSPOT_CONNECTION)
         self.ping()
-        self.nm.up(cfg.NET_WIFI_CONNECTION, cfg.NET_WIFI_TRY_TIMEOUT_SECONDS)
-        self.ping()
-        return self.nm.is_active(cfg.NET_WIFI_CONNECTION)
+        for name in self.nm.saved_wifi_profiles():
+            # each try can take a while: keep saying "connecting" so the status file never goes stale mid-probe
+            self._publish(False, False, None)
+            self.nm.up(name, cfg.NET_WIFI_TRY_TIMEOUT_SECONDS)
+            self.ping()
+            if self.nm.is_active(name):
+                return True
+        return False
 
     def _assist(self, now):
         """While waiting for the router, ask for the connection explicitly now and then.
@@ -208,13 +269,36 @@ class Netwatch:
         if self.nm.connection_state(self.cfg.NET_WIFI_CONNECTION) == "":
             self.nm.up(self.cfg.NET_WIFI_CONNECTION, self.cfg.NET_ASSIST_TIMEOUT_SECONDS)
 
+    def _due_request(self):
+        """A request that should be acted on now. Stale, repeated and not-yet-due ones are not."""
+        req = read_request(self.cfg.NET_REQUEST_PATH)
+        if req is None or req["command_id"] == self._handled:
+            return None
+        wall = self.wall()
+        if wall - req["requested_at"] > self.cfg.NET_REQUEST_MAX_AGE_SECONDS:
+            log(f"ignoring stale network request {req['command_id']}")
+            self._handled = req["command_id"]
+            return None
+        return req if wall >= req["not_before"] else None
+
+    def _apply_request(self, now, req):
+        log(f"operator requested {req['mode']} mode")
+        self._handled = req["command_id"]
+        if req["mode"] == "hotspot":
+            return self.policy.request_hotspot(now)
+        return self.policy.request_wifi(now)
+
     def tick(self):
         cfg = self.cfg
         now = self.mono()
-        wifi = self.nm.is_active(cfg.NET_WIFI_CONNECTION)
+        wifi = self.nm.wifi_up()
         hotspot = self.nm.is_active(cfg.NET_HOTSPOT_CONNECTION)
         clients = self.nm.clients() if hotspot else 0
-        action = self.policy.step(now, wifi_up=wifi, hotspot_up=hotspot, clients=clients)
+        req = self._due_request()
+        if req:
+            action = self._apply_request(now, req)
+        else:
+            action = self.policy.step(now, wifi_up=wifi, hotspot_up=hotspot, clients=clients)
 
         if action == START_HOTSPOT:
             log("starting the hotspot")
@@ -247,6 +331,9 @@ class Netwatch:
         self.write(cfg.NET_STATUS_PATH, {
             "network": network, "clients": clients if hotspot else None, "address": address,
             "since": self._since, "updated_at": self.wall(),
+            "reason": self.policy.reason, "requested": self.policy.requested,
+            "handled_request_id": self._handled,
+            "connect_timeout_s": self.policy.connect_timeout, "empty_grace_s": self.policy.empty_grace,
         })
 
 
@@ -262,7 +349,9 @@ def run_forever(stop):
     nm = Nm(cfg)
     policy = NetPolicy(time.monotonic(), system_uptime(), boot_grace=cfg.NET_BOOT_GRACE_SECONDS,
                        retry_interval=cfg.NET_RETRY_INTERVAL_SECONDS,
-                       drop_grace=cfg.NET_WIFI_DROP_GRACE_SECONDS, log=log)
+                       drop_grace=cfg.NET_WIFI_DROP_GRACE_SECONDS,
+                       connect_timeout=cfg.NET_HOTSPOT_CONNECT_TIMEOUT_SECONDS,
+                       empty_grace=cfg.NET_HOTSPOT_EMPTY_GRACE_SECONDS, log=log)
     watch = Netwatch(nm, policy, cfg)
     log(f"started, uptime {system_uptime():.0f}s, home profile '{cfg.NET_WIFI_CONNECTION}'")
     if not nm.regulatory_country_set():
