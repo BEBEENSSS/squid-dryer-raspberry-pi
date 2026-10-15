@@ -17,8 +17,17 @@
           "safe_temp_c": { ".validate": "newData.isNumber() && newData.val() >= 25 && newData.val() <= 50" },
           "heater_cutoff_c": { ".validate": "newData.isNumber() && newData.val() >= 30 && newData.val() <= 58" },
           "manual_target_temp_c": { ".validate": "newData.isNumber() && newData.val() >= 30 && newData.val() <= 55" },
+          "temp_max_c": { ".validate": "newData.isNumber() && newData.val() >= 35 && newData.val() <= 60" },
           "manual_target_humidity": { ".validate": "newData.isNumber() && newData.val() >= 20 && newData.val() <= 80" },
           "updated_at": { ".validate": "newData.val() == now" },
+          "changed_at": {
+            "safe_temp_c": { ".validate": "newData.val() == now" },
+            "heater_cutoff_c": { ".validate": "newData.val() == now" },
+            "manual_target_temp_c": { ".validate": "newData.val() == now" },
+            "temp_max_c": { ".validate": "newData.val() == now" },
+            "manual_target_humidity": { ".validate": "newData.val() == now" },
+            "$other": { ".validate": false }
+          },
           "$other": { ".validate": false }
         },
         "network": {

@@ -10,7 +10,7 @@ import config
 import recovery
 import warmup
 from command_age import cloud_verdict
-from machine_settings import HeaterCutoff, MachineSettings
+from machine_settings import MAX_KEY, TARGET_KEY, HeaterCutoff, MachineSettings
 from task_store import SNAPSHOT_FIELDS
 
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -92,9 +92,13 @@ def _detail(diag):
     return "; ".join(parts)[:200] or None
 
 
-def session_snapshot(cfg):
-    """Everything a session runs with, frozen at start so later config edits cannot change it."""
-    target, tolerance = float(cfg.TASK_SETPOINT_C), float(cfg.TARGET_TOLERANCE_C)
+def session_snapshot(cfg, settings):
+    """Everything a session runs with, frozen at start so later config edits cannot change it.
+
+    The target and the maximum are the saved settings of the moment. A later target or a raised maximum
+    waits for the next task; a lowered maximum still applies at once (`TaskManager.task_limit`).
+    """
+    target, tolerance = float(settings.get(TARGET_KEY)), float(cfg.TARGET_TOLERANCE_C)
     allowance = getattr(cfg, "ZONE_FLOOR_ALLOWANCE_C", {})
     return {
         "target_c": target,
@@ -104,7 +108,7 @@ def session_snapshot(cfg):
         "median_window": int(cfg.MEDIAN_WINDOW),
         "warmup_timeout_s": float(cfg.WARMUP_TIMEOUT_SECONDS),
         "dip_limit_s": float(cfg.DIP_WARNING_LIMIT_SECONDS),
-        "max_temp_c": float(cfg.MAX_TEMP_CUTOFF_C),
+        "max_temp_c": float(settings.get(MAX_KEY)),
         # each upper zone's own floor: the shared band floor, lowered by what that zone is allowed to lag
         **{col: target - tolerance - float(allowance.get(zone, 0.0)) for zone, col in ZONE_FLOOR_COLUMNS.items()},
     }
@@ -216,6 +220,17 @@ class TaskManager:
     @property
     def heater_cutoff_c(self):
         return self.settings.get("heater_cutoff_c")
+
+    @property
+    def temp_max_c(self):
+        """The saved maximum temperature: the over-temperature limit for manual heating and for new tasks."""
+        return self.settings.get(MAX_KEY)
+
+    def task_limit(self, task):
+        """The over-temperature limit a task is held to: the maximum it started with, or the saved maximum
+        if the operator has lowered it since. Raising the maximum never loosens a task that is running."""
+        frozen = (task or {}).get("max_temp_c")
+        return self.temp_max_c if not _number(frozen) else min(frozen, self.temp_max_c)
 
     # ---------------- queries ----------------
     def busy(self):
@@ -359,7 +374,7 @@ class TaskManager:
                 # accepted by firmware from before warm-up existed: it was already drying, so keep
                 # that clock and freeze the settings it is running with now
                 task = self.store.update_task(
-                    task["task_id"], drying_started_wall=task["started_wall"], **session_snapshot(self.cfg),
+                    task["task_id"], drying_started_wall=task["started_wall"], **session_snapshot(self.cfg, self.settings),
                     event=("session_backfilled", "task from older firmware, settings frozen at upgrade", None))
             if task["status"] == "recovery_required":
                 self.out.all_off()
@@ -475,8 +490,9 @@ class TaskManager:
         # the hottest healthy sensor decides, so a hot spot the heater's own sensor cannot see still stops it
         hot = self.hottest()
         hot = temp if hot is None else hot
-        if hot >= t["max_temp_c"]:
-            diag = {"temp_c": hot, "temp_max_c": t["max_temp_c"]}
+        limit = self.task_limit(t)
+        if hot >= limit:
+            diag = {"temp_c": hot, "temp_max_c": limit}
             if self.zones is not None:
                 diag["zone_temps_c"] = self.zones.temps()
             self._end("failed", "over_temperature", now, diag)
@@ -648,7 +664,8 @@ class TaskManager:
         # so later readings partly measure the cooling caused by this check itself
         gap = recovery.interruption_gap(task, self.boot_id, now, self.wall(), synced)
         d = recovery.decide_recovery(task, r["readings"][:5], self.sensor.ok(), gap,
-                                     r["boot_changed"], r["clean_shutdown"], self.cfg)
+                                     r["boot_changed"], r["clean_shutdown"], self.cfg,
+                                     max_temp_c=self.task_limit(task))
         d.diagnostics["clock_synced"] = synced
         self.recovery = None
 
@@ -684,7 +701,7 @@ class TaskManager:
             return self._end("failed", "invalid_session", now, diag)
         if current is None:
             return self._end("failed", "sensor_unavailable", now, diag)
-        if current >= task["max_temp_c"]:
+        if current >= self.task_limit(task):
             return self._end("failed", "over_temperature", now, dict(diag, temp_c=current))
         self._begin_warming(task["warmup_elapsed_s"] or 0.0, now,
                             ("task_resumed", "warm-up resumed after a restart, target not yet confirmed", diag))
@@ -882,10 +899,10 @@ class TaskManager:
             if any(z not in bypass.split(",") for z in unhealthy):
                 raise Rejected("zone_sensor_unavailable")  # the operator may start without it, knowingly
         hot = self.hottest()
-        if (temp if hot is None else hot) >= cfg.TEMP_MAX_C - cfg.TEMP_RESUME_DROP:
+        if (temp if hot is None else hot) >= self.temp_max_c - cfg.TEMP_RESUME_DROP:
             raise Rejected("too_hot")
 
-        snap = session_snapshot(cfg)
+        snap = session_snapshot(cfg, self.settings)
         if self.zones is None:
             snap = {k: v for k, v in snap.items() if k not in ZONE_FLOOR_COLUMNS.values()}  # nothing to track
         else:
@@ -1022,7 +1039,7 @@ class TaskManager:
         temp = self.sensor.temp()
         if temp is None:
             raise Rejected("sensor_unavailable")
-        if temp >= self.cfg.TEMP_MAX_C - self.cfg.TEMP_RESUME_DROP:
+        if temp >= self.task_limit(self.task) - self.cfg.TEMP_RESUME_DROP:
             raise Rejected("too_hot")
         self._begin_running(self.task["elapsed_s"] or 0.0, self.mono(),
                             ("task_resumed", "resumed after explicit confirmation",

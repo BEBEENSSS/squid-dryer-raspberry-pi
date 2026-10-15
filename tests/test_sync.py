@@ -44,7 +44,7 @@ def test_command_ack_and_state_published(rig):
     assert rep["status"] == "warming_up" and rep["row_levels"] == "1,2" and rep["batch_count"] == 10
     assert rep["progress_percent"] == 0 and rep["duration_minutes"] == 5
     assert rep["started_at"] and rep.get("drying_started_at") is None  # (Firebase drops null fields)
-    assert rep["target_temp_c"] == config.TASK_SETPOINT_C
+    assert rep["target_temp_c"] == config.MANUAL_TARGET_TEMP_C  # the saved target (default 55) is the task's
     assert rep["reported_at"] == {".sv": "timestamp"}
     assert st["status"] == "warming_up" and st["ready"] is False
     assert "online" not in st and st["last_seen"] == {".sv": "timestamp"}
@@ -153,6 +153,7 @@ def _reading(rig, temp):
 
 def test_manual_heating_blocked_after_boot_until_reenabled_then_runs_offline(rig):
     manual, sync, base = _manual_rig(rig, online=False)
+    rig.tm.apply_settings({"manual_target_temp_c": 47, "updated_at": 1})  # the saved target everything below holds
     _reading(rig, 30)
     manual.apply(True, True)
     assert not rig.out.heater.is_active  # blocked until Firebase confirms
@@ -213,6 +214,22 @@ def test_manual_faults_disable_heating_regardless_of_cutoff(rig):
         rig.sensor.poll()
     manual.tick()
     assert not rig.out.heater.is_active and not manual.enabled and manual.block == "sensor_fault"
+
+
+def test_manual_over_temperature_fault_is_the_saved_max_even_offline(rig):
+    manual, sync, base = _manual_rig(rig)
+    rig.tm.apply_settings({"manual_target_temp_c": 40, "temp_max_c": 46, "updated_at": 1})
+    _reading(rig, 35)
+    manual.apply(True, True)
+    assert rig.out.heater.is_active
+    base.fail = True  # the network is gone: the saved maximum is all the machine has, and it is enough
+    sync.sync_once()
+    _reading(rig, 45)  # below the saved maximum, far below the old fixed 60
+    manual.tick()
+    assert manual.enabled
+    _reading(rig, 46)
+    manual.tick()
+    assert not rig.out.heater.is_active and not manual.enabled and manual.block == "over_temperature"
 
 
 def test_safe_temp_setting_is_polled_once(rig):

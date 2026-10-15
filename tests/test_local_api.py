@@ -140,6 +140,18 @@ def test_settings_are_range_checked_and_queued_for_the_control_loop(api):
     assert api.queue.get_nowait() == ("settings_local", {"heater_cutoff_c": 50.0})
 
 
+def test_target_and_max_are_checked_together_when_sent_together(api):
+    _, cookie = login(api)
+    # in range each, but only 3 C apart: the maximum must be at least 5 C above the target
+    resp, raw = call(api, "POST", "/api/settings", {"manual_target_temp_c": 50, "temp_max_c": 53}, cookie)
+    assert resp.status == 400 and json.loads(raw)["error"] == "target_max_gap"
+    assert call(api, "POST", "/api/settings", {"temp_max_c": 99}, cookie)[0].status == 400
+    assert api.queue.empty()
+    # one alone is queued as given: the machine checks it against the other one it has saved
+    assert call(api, "POST", "/api/settings", {"temp_max_c": 52}, cookie)[0].status == 202
+    assert api.queue.get_nowait() == ("settings_local", {"temp_max_c": 52.0})
+
+
 def test_task_request_is_whitelisted_and_gets_a_command_id(api):
     _, cookie = login(api)
     assert call(api, "POST", "/api/task/request", {"command": "format_disk"}, cookie)[0].status == 400

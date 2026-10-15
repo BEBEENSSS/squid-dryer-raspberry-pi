@@ -165,7 +165,7 @@ class ManualControl:
             return self._disable("heater off: temperature sensor failed", "sensor_fault")
         hot = self.tm.hottest()  # the hottest healthy sensor, so a hot spot sensor 1 cannot see still counts
         hot = temp if hot is None else hot
-        if hot >= cfg.TEMP_MAX_C:
+        if hot >= self.tm.temp_max_c:  # the saved maximum, read locally, so it holds without the network
             return self._disable(f"heater off: over temperature ({hot:.1f} C)", "over_temperature")
         if not self.out.fan.is_active:
             return self._disable("heater off: fan is not running", "no_fan")
@@ -253,7 +253,7 @@ def main():
         if not ok:
             return "sensor_fault"
         hot = tm.hottest()
-        if (sensor.temp_c if hot is None else hot) >= config.TEMP_MAX_C:
+        if (sensor.temp_c if hot is None else hot) >= tm.temp_max_c:
             return "over_temperature"
         if out.heater.latched:
             return out.heater.latched
@@ -270,7 +270,7 @@ def main():
         net = network_status() or {}  # empty when netwatch is not running: the keys are then removed
         # a new task may start while cooling once the machine is cool enough to accept it
         hot = tm.hottest()
-        cool_enough = ok and (sensor.temp_c if hot is None else hot) < config.TEMP_MAX_C - config.TEMP_RESUME_DROP
+        cool_enough = ok and (sensor.temp_c if hot is None else hot) < tm.temp_max_c - config.TEMP_RESUME_DROP
         return {
             "fan": out.fan.is_active,
             "heater": out.heater.is_active,
@@ -278,13 +278,13 @@ def main():
             "temp": round(sensor.temp_c, 1) if ok else None,  # None removes the key
             "sensor_ok": ok,
             **zone_state(zones),
-            "temp_max": config.TEMP_MAX_C,
+            "temp_max": tm.temp_max_c,  # the maximum the machine enforces, not a target
             "status": machine,
             "cooling": tm.cooling_active(),
             "safe_temp": tm.safe_temp_c,
             "heater_cutoff": tm.heater_cutoff_c,
             "heater_cutoff_margin": config.HEATER_CUTOFF_MARGIN_C,
-            "target_temp": tm.settings.get("manual_target_temp_c"),
+            "target_temp": tm.settings.get("manual_target_temp_c"),  # manual heating and the next task
             "target_humidity": tm.settings.get("manual_target_humidity"),
             "settings_updated_at": tm.settings.updated_at,
             "manual_heating": manual.enabled,

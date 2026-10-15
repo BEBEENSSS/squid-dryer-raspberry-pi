@@ -69,7 +69,7 @@ def test_report_lists_each_zone_with_its_frozen_floor(zrig):
     zrig.run(10)
     snap = zrig.tm.snapshot()
     assert set(snap["zones"]) == {"bottom", "middle", "top"}
-    assert {z["floor_c"] for z in snap["zones"].values()} == {config.TASK_SETPOINT_C - config.TARGET_TOLERANCE_C}
+    assert {z["floor_c"] for z in snap["zones"].values()} == {config.MANUAL_TARGET_TEMP_C - config.TARGET_TOLERANCE_C}
     assert snap["bypass_zones"] is None
     assert snap["smoothed_temp_c"] == snap["zones"]["bottom"]["smoothed_temp_c"]  # unchanged meaning
 
@@ -220,11 +220,11 @@ def test_a_hot_middle_sensor_trips_over_temperature_even_if_the_bottom_is_fine(z
     pin(zrig, bottom=50.0, middle=40.0)
     zrig.start(warmup=True)
     zrig.run(6)
-    zrig.oven.zone_fixed["middle"] = config.MAX_TEMP_CUTOFF_C + 0.5
+    zrig.oven.zone_fixed["middle"] = config.TEMP_MAX_C + 0.5
     zrig.run(4)
     t = zrig.task()
     assert (t["status"], t["failure_reason"]) == ("failed", "over_temperature")
-    assert t["diagnostics"]["zone_temps_c"]["middle"] == config.MAX_TEMP_CUTOFF_C + 0.5
+    assert t["diagnostics"]["zone_temps_c"]["middle"] == config.TEMP_MAX_C + 0.5
     assert not zrig.out.heater.is_active
 
 

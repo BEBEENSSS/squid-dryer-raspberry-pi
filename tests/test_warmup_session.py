@@ -24,7 +24,7 @@ def test_drying_clock_waits_for_the_target(rig):
     assert rig.out.heater.is_active and rig.out.fan.is_active
     snap = rig.tm.snapshot()
     assert snap["status"] == "warming_up" and snap["drying_started_at"] is None
-    assert snap["progress_percent"] == 0 and snap["target_temp_c"] == config.TASK_SETPOINT_C
+    assert snap["progress_percent"] == 0 and snap["target_temp_c"] == config.MANUAL_TARGET_TEMP_C
     assert 29 <= snap["warmup_seconds"] <= 31  # live warm-up time
 
     t = drive_to_drying(rig)
@@ -70,7 +70,8 @@ def test_session_settings_are_frozen_at_start(rig, monkeypatch):
     rig.start(warmup=True)
     monkeypatch.setattr(config, "TARGET_TOLERANCE_C", 10.0)
     monkeypatch.setattr(config, "DWELL_SECONDS", 1)
-    monkeypatch.setattr(config, "TASK_SETPOINT_C", 30.0)
+    # the saved target is copied into the task at start: a new target waits for the next task
+    assert rig.tm.apply_settings({"manual_target_temp_c": 40, "updated_at": 1}) == ["manual_target_temp_c"]
     t = drive_to_drying(rig)
     assert (t["tolerance_c"], t["dwell_s"], t["target_c"]) == (2.5, 60, 55.0)
     assert t["target_confirmed_wall"] - t["drying_started_wall"] >= 60
@@ -105,7 +106,7 @@ def test_a_short_dropout_restarts_the_dwell_instead_of_counting_as_reached(rig):
 def test_over_temperature_during_warmup_faults(rig):
     rig.start(warmup=True)
     rig.run(5)
-    rig.oven.fixed = config.MAX_TEMP_CUTOFF_C + 0.5
+    rig.oven.fixed = config.TEMP_MAX_C + 0.5
     rig.run(3)
     t = rig.task()
     assert (t["status"], t["failure_reason"]) == ("failed", "over_temperature")
@@ -272,6 +273,6 @@ def test_task_from_older_firmware_keeps_its_clock_and_gets_a_snapshot(tmp_path):
     r2 = r.reboot(downtime=10, temp=r.oven.temp)
     r2.run(config.RECOVERY_OBSERVE_SECONDS + 2)
     t = r2.task()
-    assert t["target_c"] == config.TASK_SETPOINT_C
+    assert t["target_c"] == config.MANUAL_TARGET_TEMP_C
     assert t["drying_started_wall"] == t["started_wall"]
     assert t["status"] == "running"

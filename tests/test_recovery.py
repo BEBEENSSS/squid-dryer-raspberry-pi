@@ -188,6 +188,12 @@ def test_decision_table(current, gap, boot, clean, expected):
     assert (d.action, d.reason) == expected
 
 
+def test_decision_uses_the_tasks_own_over_temperature_limit():
+    assert recovery.decide_recovery(TASK, [50.0] * 3, True, 30, True, False).reason == "checks_passed"
+    d = recovery.decide_recovery(TASK, [50.0] * 3, True, 30, True, False, max_temp_c=50.0)
+    assert (d.action, d.reason) == ("recovery_required", "over_temperature")
+
+
 def test_decision_needs_enough_readings_and_reference():
     assert recovery.decide_recovery(TASK, [50.0], True, 30, True, False).reason == "sensor_unavailable"
     assert recovery.decide_recovery(TASK, [50.0] * 3, False, 30, True, False).reason == "sensor_unavailable"

@@ -34,7 +34,9 @@ def interruption_gap(task, boot_id, mono_now, wall_now, clock_synced_now):
     return gap if gap >= 0 else None
 
 
-def decide_recovery(task, readings, sensor_ok, gap_s, boot_changed, clean_shutdown, cfg=config):
+def decide_recovery(task, readings, sensor_ok, gap_s, boot_changed, clean_shutdown, cfg=config, max_temp_c=None):
+    # the task's over-temperature limit; the firmware ceiling when the caller does not know a lower one
+    limit = cfg.TEMP_MAX_C if max_temp_c is None else max_temp_c
     ref = task.get("last_temp_c")
     current = median(readings) if sensor_ok and len(readings) >= cfg.RECOVERY_MIN_READS else None
     drop = round(ref - current, 2) if ref is not None and current is not None else None
@@ -58,7 +60,7 @@ def decide_recovery(task, readings, sensor_ok, gap_s, boot_changed, clean_shutdo
 
     if current is None:
         return Decision(RECOVERY_REQUIRED, "sensor_unavailable", diag)
-    if current >= cfg.TEMP_MAX_C:
+    if current >= limit:
         return Decision(RECOVERY_REQUIRED, "over_temperature", diag)
     if ref is None or not (-55.0 <= ref <= 125.0):  # DS18B20 range
         return Decision(RECOVERY_REQUIRED, "no_reference_temp", diag)

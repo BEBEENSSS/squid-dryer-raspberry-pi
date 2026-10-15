@@ -17,8 +17,13 @@ W1_BASE = Path("/sys/bus/w1/devices")
 SENSOR_INTERVAL = 2             # seconds between reads
 SENSOR_BAD_LIMIT = 3            # this many bad reads in a row -> sensor failed
 SENSOR_STALE_SECONDS = 10       # no good read for this long -> sensor failed
-TEMP_MAX_C = 60.0               # heater hard cutoff, CHANGE TO YOUR LIMIT
+TEMP_MAX_C = 60.0               # firmware ceiling for the over-temperature fault, and the default maximum
 TEMP_RESUME_DROP = 5.0          # heater can be re-enabled once this far below max
+# The maximum is an operator setting (settings/temp_max_c), saved on the Pi. It can go lower than TEMP_MAX_C,
+# never higher, and must stay at least TEMP_MAX_GAP_C above the target so normal overshoot cannot trip the fault.
+TEMP_MAX_MIN_C = 35.0           # mirrors database.rules.json
+TEMP_MAX_MAX_C = TEMP_MAX_C
+TEMP_MAX_GAP_C = TEMP_RESUME_DROP
 
 # ---------------- chamber zones: one DS18B20 per 1-Wire bus ----------------
 # bottom = sensor 1 (GPIO4, near the heater and fan), middle = sensor 2 (GPIO22), top = sensor 3 (GPIO23).
@@ -52,7 +57,9 @@ HEATER_MIN_RISE_C = 2.0
 # ---------------- manual mode (commands/fan, commands/heater) ----------------
 # commands/heater=true enables manual heating; the Pi then holds the target with hysteresis,
 # with or without internet. The saved targets live in local storage (see machine_settings.py).
-MANUAL_TARGET_TEMP_C = 47.0     # defaults, used until valid saved values exist
+# The target is one setting for manual heating and for drying tasks. Until a valid saved value exists it is
+# 5 C below the default maximum, which is where tasks always ran before the target was configurable.
+MANUAL_TARGET_TEMP_C = TEMP_MAX_C - TEMP_RESUME_DROP  # defaults, used until valid saved values exist
 MANUAL_TARGET_TEMP_MIN_C = 30.0  # mirrors database.rules.json
 MANUAL_TARGET_TEMP_MAX_C = 55.0
 MANUAL_HYSTERESIS_C = 2.0       # manual heater back on at target - hysteresis
@@ -68,8 +75,8 @@ HEATER_CUTOFF_MAX_C = 58.0
 HEATER_CUTOFF_MARGIN_C = 3.0    # recovery margin, prevents rapid switching around the limit
 
 # ---------------- drying tasks ----------------
-TASK_SETPOINT_C = TEMP_MAX_C - TEMP_RESUME_DROP  # thermostat target during a task
-TASK_HYSTERESIS_C = 2.0         # heater back on at setpoint - hysteresis
+# A task's target and maximum are the saved settings (machine_settings.py), copied into the task when it starts.
+TASK_HYSTERESIS_C = 2.0         # heater back on at target - hysteresis
 CHECKPOINT_SECONDS = 10         # how often running-task progress is saved to disk
 
 # ---------------- warm-up before drying ----------------
@@ -85,7 +92,6 @@ DWELL_SECONDS = 60              # ...continuously for this long
 DWELL_MAX_GAP_SECONDS = SENSOR_INTERVAL * 2.5  # a missing sample restarts the dwell
 WARMUP_TIMEOUT_SECONDS = 3 * 3600  # target not confirmed by then -> FAULT, heater off
 DIP_WARNING_LIMIT_SECONDS = 600  # a drying-phase dip below the band this long raises a warning
-MAX_TEMP_CUTOFF_C = min(TASK_SETPOINT_C + 10.0, TEMP_MAX_C)  # software over-temperature fault
 TEMP_PLAUSIBLE_MIN_C = -10.0    # outside this range a reading counts as a failed read
 TEMP_PLAUSIBLE_MAX_C = 100.0
 TEMP_LOG_UPLOAD_SECONDS = 60    # per-minute temperature summaries go to Firebase this often

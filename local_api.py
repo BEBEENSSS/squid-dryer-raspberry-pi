@@ -155,6 +155,10 @@ def parse_settings(body):
         if not _is_number(value) or not getattr(config, lo) <= value <= getattr(config, hi):
             return None, f"out_of_range:{key}"
         out[key] = float(value)
+    # a body carrying both can be judged here; with only one, the machine checks it against the saved other
+    target, maximum = out.get(machine_settings.TARGET_KEY), out.get(machine_settings.MAX_KEY)
+    if target is not None and maximum is not None and not machine_settings.gap_ok(target, maximum):
+        return None, "target_max_gap"
     return out, None
 
 
