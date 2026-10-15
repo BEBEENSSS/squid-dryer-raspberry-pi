@@ -16,6 +16,10 @@ from task_store import SNAPSHOT_FIELDS
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MODES = ("standard", "experiment")
 HEATING_STATUSES = ("warming_up", "running")  # the thermostat is live in these
+# zones whose warm-up floor is frozen on the task, and the column holding it. The bottom (control) zone's
+# floor is always target_c - tolerance_c; the control sensor can never be bypassed.
+ZONE_FLOOR_COLUMNS = {"middle": "floor_middle_c", "top": "floor_top_c"}
+BYPASSABLE_ZONES = tuple(ZONE_FLOOR_COLUMNS)
 
 
 def _number(v):
@@ -56,6 +60,18 @@ def parse_row_levels(value, allowed):
     return ",".join(str(r) for r in sorted(rows))
 
 
+def parse_bypass_zones(value):
+    """'top,middle' -> 'middle,top' normalised ('' for none), or None if invalid. Never includes the bottom."""
+    if value is None or value == "":
+        return ""
+    if not isinstance(value, str) or len(value) > 64:
+        return None
+    zones = [z.strip() for z in value.split(",")]
+    if len(set(zones)) != len(zones) or any(z not in BYPASSABLE_ZONES for z in zones):
+        return None
+    return ",".join(z for z in BYPASSABLE_ZONES if z in zones)
+
+
 def _detail(diag):
     """Short human-readable summary of failure diagnostics (full data goes to events)."""
     if not diag:
@@ -78,15 +94,19 @@ def _detail(diag):
 
 def session_snapshot(cfg):
     """Everything a session runs with, frozen at start so later config edits cannot change it."""
+    target, tolerance = float(cfg.TASK_SETPOINT_C), float(cfg.TARGET_TOLERANCE_C)
+    allowance = getattr(cfg, "ZONE_FLOOR_ALLOWANCE_C", {})
     return {
-        "target_c": float(cfg.TASK_SETPOINT_C),
-        "tolerance_c": float(cfg.TARGET_TOLERANCE_C),
+        "target_c": target,
+        "tolerance_c": tolerance,
         "hysteresis_c": float(cfg.TASK_HYSTERESIS_C),
         "dwell_s": float(cfg.DWELL_SECONDS),
         "median_window": int(cfg.MEDIAN_WINDOW),
         "warmup_timeout_s": float(cfg.WARMUP_TIMEOUT_SECONDS),
         "dip_limit_s": float(cfg.DIP_WARNING_LIMIT_SECONDS),
         "max_temp_c": float(cfg.MAX_TEMP_CUTOFF_C),
+        # each upper zone's own floor: the shared band floor, lowered by what that zone is allowed to lag
+        **{col: target - tolerance - float(allowance.get(zone, 0.0)) for zone, col in ZONE_FLOOR_COLUMNS.items()},
     }
 
 
@@ -98,6 +118,11 @@ def snapshot_valid(task):
         return False
     if not all(_number(x) for x in v.values()):
         return False
+    # the zone floors are optional (older firmware never had them), but a floor that is there must make sense
+    for col in ZONE_FLOOR_COLUMNS.values():
+        floor = task.get(col)
+        if floor is not None and not (_number(floor) and 0 < floor < v["target_c"]):
+            return False
     return (0 < v["target_c"] < v["max_temp_c"] and v["tolerance_c"] > 0 and v["hysteresis_c"] > 0
             and v["dwell_s"] > 0 and v["median_window"] >= 1 and v["warmup_timeout_s"] > 0
             and v["dip_limit_s"] > 0)
@@ -112,10 +137,12 @@ class Rejected(Exception):
 
 class TaskManager:
     def __init__(self, store, outputs, sensor, boot_id, clock_synced_fn,
-                 mono=time.monotonic, wall=time.time, cfg=config, on_task_start=None):
+                 mono=time.monotonic, wall=time.time, cfg=config, on_task_start=None, zones=None):
         self.store = store
         self.out = outputs
-        self.sensor = sensor
+        self.sensor = sensor        # the control sensor: thermostat, heater interlock and recovery use only this
+        # hardware.SensorArray with the middle and top sensors too, or None for a single-sensor machine
+        self.zones = zones
         self.boot_id = boot_id
         self.clock_synced = clock_synced_fn
         self.mono = mono
@@ -132,9 +159,10 @@ class TaskManager:
         self.last_checkpoint = 0.0
         self.warm_base = 0.0        # powered-on warm-up time accumulated before this segment
         self.warm_segment_start = None
-        self.detector = None        # warmup.TargetDetector, rebuilt from the task's own snapshot
+        self.detector = None        # warmup.ZoneDetector, rebuilt from the task's own snapshot
         self.dips = None            # warmup.DipTracker, drying phase only
-        self._seen_reads = 0
+        self._seen = {}             # zone -> sensor.reads already handed to the detector
+        self._zone_faults = set()   # zones whose fault was logged during this drying session
         self._log_buf = []          # temperature samples waiting for the next checkpoint
         self.recovery = None        # observation state while deciding after a restart
         self.cooling = None         # {"start": monotonic} while the fan runs the machine down
@@ -146,6 +174,39 @@ class TaskManager:
                    "band, so the target may never be confirmed")
             print("warning:", msg)
             store.log_event("config_warning", msg)
+        if zones is not None and not zones.configured():
+            msg = ("sensor ids for " + ", ".join(zones.unconfigured()) + " are placeholders in config.py "
+                   "(ZONE_SENSOR_IDS): every task start is rejected until they are real")
+            print("warning:", msg)
+            store.log_event("config_warning", msg)
+
+    # ---------------- chamber zones ----------------
+    @property
+    def control_zone(self):
+        return self.zones.control_zone if self.zones is not None else getattr(self.cfg, "CONTROL_ZONE", "bottom")
+
+    def _sensor_for(self, zone):
+        return self.zones.sensors[zone] if self.zones is not None else self.sensor
+
+    def hottest(self):
+        """The reading over-temperature and cooldown go by: the hottest healthy sensor. Without a
+        healthy control sensor it is None, exactly like a single sensor that has failed."""
+        return self.zones.hottest() if self.zones is not None else self.sensor.temp()
+
+    @staticmethod
+    def _bypassed(task):
+        return {z for z in ((task or {}).get("bypass_zones") or "").split(",") if z}
+
+    def _required_zones(self, task):
+        """The zones warm-up has to see in band: the control one, plus the middle and top unless this
+        session has no floor for them (older firmware) or the operator started without them."""
+        required = [self.control_zone]
+        if self.zones is not None:
+            bypass = self._bypassed(task)
+            for zone, col in ZONE_FLOOR_COLUMNS.items():
+                if zone in self.zones.sensors and task.get(col) is not None and zone not in bypass:
+                    required.append(zone)
+        return tuple(required)
 
     @property
     def safe_temp_c(self):
@@ -208,7 +269,9 @@ class TaskManager:
                 warmup_s = self.wall() - t["started_wall"]
             else:
                 warmup_s = None
-            smoothed = self.detector.smoothed if live and self.detector is not None else None
+            live_detector = self.detector if live else None
+            # the bottom (control) sensor's, as it always was; the other zones are in "zones"
+            smoothed = live_detector.smoothed(live_detector.control) if live_detector is not None else None
             return {
                 "task_id": t["task_id"],
                 "status": t["status"],
@@ -226,6 +289,8 @@ class TaskManager:
                 "dwell_seconds": t["dwell_s"],
                 "warmup_timeout_seconds": t["warmup_timeout_s"],
                 "smoothed_temp_c": round(smoothed, 1) if smoothed is not None else None,
+                "zones": self._zone_report(t, live_detector),
+                "bypass_zones": t.get("bypass_zones") or None,  # zones the operator started without
                 "dips": [{"start": int(d["start_wall"] * 1000),
                           "end": int(d["end_wall"] * 1000) if d["end_wall"] else None,
                           "min_temp_c": round(d["min_c"], 1)} for d in dips] or None,
@@ -245,6 +310,23 @@ class TaskManager:
                 "acknowledged": bool(t["acknowledged"]),
                 "batches": self._batch_snapshots(t["task_id"], elapsed),
             }
+
+    def _zone_report(self, task, detector):
+        """Per-zone warm-up picture for the report: smoothed reading, the zone's floor and whether it is in
+        band right now. None unless this is a live three-zone session (the key is then removed)."""
+        if detector is None or self.zones is None:
+            return None
+        bypass = self._bypassed(task)
+        out = {}
+        for zone in detector.zones:
+            smoothed = detector.smoothed(zone)
+            out[zone] = {
+                "smoothed_temp_c": round(smoothed, 1) if smoothed is not None else None,
+                "floor_c": round(detector.floor(zone), 1),
+                "in_band": detector.in_band(zone),
+                "bypassed": True if zone in bypass else None,
+            }
+        return out
 
     def _batch_snapshots(self, task_id, task_elapsed):
         """Per-batch timing for batches added mid-task, each measured from when it was added."""
@@ -350,7 +432,7 @@ class TaskManager:
     def _begin_cooling(self, now):
         """Heater off, fan on until the measured temperature is safe. No-op if already safe."""
         self.out.heater.off()
-        temp = self.sensor.temp()
+        temp = self.hottest()  # the chamber is safe only once its hottest zone is
         if temp is not None and temp <= self.safe_temp_c:
             self.cooling = None
             self.out.fan.off()
@@ -364,7 +446,7 @@ class TaskManager:
         self.out.heater.off()  # never heat while cooling
         self.out.fan.on()
         waited = now - self.cooling["start"]
-        temp = self.sensor.temp()
+        temp = self.hottest()
         if temp is not None and temp <= self.safe_temp_c:
             reason, msg = "cooling_complete", "cooling complete, fan off"
         elif waited >= self.cfg.COOLDOWN_MAX_SECONDS:
@@ -390,9 +472,24 @@ class TaskManager:
             self._end("failed", "sensor_failure", now,
                       {"last_valid_temp_c": self.sensor.temp_c, "bad_reads": self.sensor.bad_reads})
             return False
-        if temp >= t["max_temp_c"]:
-            self._end("failed", "over_temperature", now, {"temp_c": temp, "temp_max_c": t["max_temp_c"]})
+        # the hottest healthy sensor decides, so a hot spot the heater's own sensor cannot see still stops it
+        hot = self.hottest()
+        hot = temp if hot is None else hot
+        if hot >= t["max_temp_c"]:
+            diag = {"temp_c": hot, "temp_max_c": t["max_temp_c"]}
+            if self.zones is not None:
+                diag["zone_temps_c"] = self.zones.temps()
+            self._end("failed", "over_temperature", now, diag)
             return False
+        if self.zones is not None and t["status"] == "warming_up":
+            # warm-up cannot be confirmed without a zone it is waiting for, and the heater is already on:
+            # stop safely, the operator can start again without that sensor
+            for zone in self._required_zones(t):
+                if zone != self.control_zone and not self.zones.healthy(zone):
+                    sensor = self.zones.sensors[zone]
+                    self._end("failed", "zone_sensor_failure", now,
+                              {"zone": zone, "last_valid_temp_c": sensor.temp_c, "bad_reads": sensor.bad_reads})
+                    return False
 
         # thermostat, never heat without airflow. The cut-off only pauses heating: the timer,
         # checkpoints and fan carry on, and the fault checks above stay independent of it.
@@ -409,21 +506,66 @@ class TaskManager:
 
     def _new_detector(self):
         t = self.task
-        self.detector = warmup.TargetDetector(t["target_c"], t["tolerance_c"], t["dwell_s"],
-                                              t["median_window"], self.cfg.DWELL_MAX_GAP_SECONDS)
-        self._seen_reads = self.sensor.reads
+        control = self.control_zone
+        floors = {control: t["target_c"] - t["tolerance_c"]}
+        if self.zones is not None:
+            for zone, col in ZONE_FLOOR_COLUMNS.items():
+                if zone in self.zones.sensors and t.get(col) is not None:
+                    floors[zone] = t[col]  # smoothed and logged even when bypassed, but only required ones count
+        self.detector = warmup.ZoneDetector(floors, self._required_zones(t), t["dwell_s"], t["median_window"],
+                                            self.cfg.DWELL_MAX_GAP_SECONDS, control=control)
+        self._seen = {zone: self._sensor_for(zone).reads for zone in floors}
 
     def _sample(self, phase):
-        """Feed a new valid reading, if there is one, to the detector and the temperature log."""
-        s = self.sensor
-        if s.reads == self._seen_reads or s.temp_c is None:
+        """Feed every new valid reading to the detector and the temperature log.
+
+        Returns None when no zone had a new reading. Otherwise (verdict, control_wall): the joint verdict
+        of the detector as of the newest reading, and the wall time of the control sensor's new reading
+        (None if only the upper zones had one), which is what dip tracking goes by.
+        """
+        task_id = self.task["task_id"]
+        control = self.detector.control
+        newest = control_wall = None
+        for zone in self.detector.zones:
+            s = self._sensor_for(zone)
+            if s.reads == self._seen[zone] or s.temp_c is None:
+                continue
+            self._seen[zone] = s.reads
+            mono = s.temp_time
+            wall = self.wall() - (self.mono() - mono)  # when it was read, not when this tick ran
+            res = self.detector.feed(zone, mono, wall, s.temp_c)
+            self._log_buf.append((task_id, wall, mono, s.temp_c, res.smoothed, phase, zone))
+            newest = mono if newest is None else max(newest, mono)
+            if zone == control:
+                control_wall = wall
+        if newest is None:
             return None
-        self._seen_reads = s.reads
-        mono = s.temp_time
-        wall = self.wall() - (self.mono() - mono)  # when it was read, not when this tick ran
-        res = self.detector.feed(mono, wall, s.temp_c)
-        self._log_buf.append((self.task["task_id"], wall, mono, s.temp_c, res.smoothed, phase))
-        return res, wall
+        if phase == "warming_up" and self.zones is not None:
+            for zone in self.detector.newly_in_band():
+                self.store.log_event("warmup_zone_reached", f"{zone} reached the warm-up band", task_id,
+                                     {"zone": zone, "smoothed_c": round(self.detector.smoothed(zone), 2),
+                                      "floor_c": round(self.detector.floor(zone), 2),
+                                      "warmup_s": round(self.warm_elapsed(self.mono()), 1)})
+        return self.detector.result(newest), control_wall
+
+    def _note_zone_faults(self):
+        """While drying, a middle or top sensor that stops reading only warns: sensor 1 still holds the
+        thermostat. Logged once when it fails and once when it recovers; the live flag is in state."""
+        if self.zones is None:
+            return
+        t = self.task
+        for zone in self.zones.others:
+            if zone in self._bypassed(t):
+                continue  # the operator started without it and was told
+            if not self.zones.healthy(zone):
+                if zone not in self._zone_faults:
+                    self._zone_faults.add(zone)
+                    self.store.log_event("zone_sensor_fault", f"{zone} temperature sensor stopped giving valid "
+                                         "readings, drying continues on the others", t["task_id"], {"zone": zone})
+            elif zone in self._zone_faults:
+                self._zone_faults.discard(zone)
+                self.store.log_event("zone_sensor_restored", f"{zone} temperature sensor reads again",
+                                     t["task_id"], {"zone": zone})
 
     def _flush_log(self):
         buf, self._log_buf = self._log_buf, []
@@ -459,8 +601,9 @@ class TaskManager:
         if not self._control_heat(now):
             return
         got = self._sample("drying")
-        if got is not None and got[0].full:
+        if got is not None and got[1] is not None and got[0].full:
             self._track_dips(got[0].smoothed, got[1])
+        self._note_zone_faults()
 
         if self.elapsed(now) >= self.task["duration_s"]:
             self._end("completed", None, now)
@@ -614,6 +757,7 @@ class TaskManager:
         if self.dips is not None and self.dips.open:
             self.store.save_excursion(self.task["task_id"], self.dips.start, self.wall(), self.dips.min_c)
         self.detector = self.dips = None
+        self._zone_faults.clear()
         msg = {
             "completed": "drying task completed",
             "failed": f"task failed: {reason}",
@@ -713,6 +857,9 @@ class TaskManager:
             raise Rejected("invalid_row_levels")
         if not (_number(dur) and cfg.MIN_DURATION_MIN <= dur <= cfg.MAX_DURATION_MIN):
             raise Rejected("invalid_duration")
+        bypass = parse_bypass_zones(cmd.get("bypass_zones"))
+        if bypass is None:
+            raise Rejected("invalid_bypass_zones")  # the bottom sensor cannot be bypassed
 
         if not self.initialized or self.recovery is not None:
             raise Rejected("not_ready")
@@ -727,10 +874,22 @@ class TaskManager:
         temp = self.sensor.temp()
         if temp is None:
             raise Rejected("sensor_unavailable")
-        if temp >= cfg.TEMP_MAX_C - cfg.TEMP_RESUME_DROP:
+        unhealthy = []
+        if self.zones is not None:
+            if not self.zones.configured():
+                raise Rejected("zones_unconfigured")  # a placeholder id: nothing says which sensor is where
+            unhealthy = [z for z in self.zones.others if not self.zones.healthy(z)]
+            if any(z not in bypass.split(",") for z in unhealthy):
+                raise Rejected("zone_sensor_unavailable")  # the operator may start without it, knowingly
+        hot = self.hottest()
+        if (temp if hot is None else hot) >= cfg.TEMP_MAX_C - cfg.TEMP_RESUME_DROP:
             raise Rejected("too_hot")
 
         snap = session_snapshot(cfg)
+        if self.zones is None:
+            snap = {k: v for k, v in snap.items() if k not in ZONE_FLOOR_COLUMNS.values()}  # nothing to track
+        else:
+            snap["bypass_zones"] = bypass or None
         try:
             self.task = self.store.create_task(
                 task_id, float(w) if w is not None else None, int(count), rows, float(dur) * 60.0,
@@ -738,7 +897,9 @@ class TaskManager:
                 event=("task_accepted", "drying task accepted",
                        {"command_id": cmd["command_id"], "weight_kg": w, "batch_count": count,
                         "row_levels": rows, "duration_minutes": dur, "temp_c": temp, "mode": mode,
-                        "requested_by": cmd.get("requested_by"), **snap}))
+                        "requested_by": cmd.get("requested_by"), **snap,
+                        **({"zone_temps_c": self.zones.temps(), "zones_unhealthy": unhealthy}
+                           if self.zones is not None else {})}))
         except sqlite3.IntegrityError:
             raise Rejected("task_id_already_used", "duplicate")
         if self.on_task_start:

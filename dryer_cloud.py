@@ -11,15 +11,16 @@ SIMULATE = os.environ.get("SIMULATE") == "1"
 if SIMULATE:
     os.environ.setdefault("GPIOZERO_PIN_FACTORY", "mock")
 
+import calibration  # noqa: E402
 import config  # noqa: E402
 import sd_notify  # noqa: E402
 from cloud_sync import CloudSync  # noqa: E402
 from command_age import LocalCommandMark  # noqa: E402
-from hardware import Outputs, Sensor  # noqa: E402
+from hardware import Outputs, Sensor, SensorArray, make_reader  # noqa: E402
 from local_api import LocalApi  # noqa: E402
 from netinfo import lan_ip, read_network_status  # noqa: E402
 from network_control import NetworkControl, network_ack_payload  # noqa: E402
-from snapshot import build_snapshot  # noqa: E402
+from snapshot import build_snapshot, zone_state  # noqa: E402
 from task_manager import TaskManager  # noqa: E402
 from task_store import TaskStore  # noqa: E402
 
@@ -160,8 +161,10 @@ class ManualControl:
         temp = self.sensor.temp()
         if temp is None:
             return self._disable("heater off: temperature sensor failed", "sensor_fault")
-        if temp >= cfg.TEMP_MAX_C:
-            return self._disable(f"heater off: over temperature ({temp:.1f} C)", "over_temperature")
+        hot = self.tm.hottest()  # the hottest healthy sensor, so a hot spot sensor 1 cannot see still counts
+        hot = temp if hot is None else hot
+        if hot >= cfg.TEMP_MAX_C:
+            return self._disable(f"heater off: over temperature ({hot:.1f} C)", "over_temperature")
         if not self.out.fan.is_active:
             return self._disable("heater off: fan is not running", "no_fan")
         if self.out.heater.latched:
@@ -202,14 +205,23 @@ def main():
 
     out = Outputs()  # both relays off before anything else happens
     oven = None
+    offsets = {}  # calibration applied to each sensor, for the start-up event
     if SIMULATE:
         from sim import SimOven
         oven = SimOven()
         oven.heater = out.heater
-        sensor = Sensor(oven.read)
+        zones = SensorArray({"bottom": Sensor(oven.read),
+                             "middle": Sensor(lambda: oven.read_zone("middle")),
+                             "top": Sensor(lambda: oven.read_zone("top"))})
         print("SIMULATE=1: mock relays and a simulated chamber, no hardware is touched")
     else:
-        sensor = Sensor()
+        sensors = {}
+        for zone in config.ZONES:
+            sensor_id = config.ZONE_SENSOR_IDS[zone]
+            offsets[zone] = calibration.zone_offset(sensor_id)  # always 0 for sensor 1, the reference
+            sensors[zone] = Sensor(make_reader(sensor_id, offsets[zone]))
+        zones = SensorArray(sensors, ids=config.ZONE_SENSOR_IDS)
+    sensor = zones.control  # sensor 1 alone holds the thermostat and the heater interlock
     out.attach_sensor(sensor)
     boot_id = read_boot_id()
 
@@ -229,13 +241,14 @@ def main():
         sync.request_write("commands/heater", False)
         sync.request_write("commands/fan", False)
 
-    tm = TaskManager(store, out, sensor, boot_id, clock_synced, on_task_start=on_task_start)
+    tm = TaskManager(store, out, sensor, boot_id, clock_synced, on_task_start=on_task_start, zones=zones)
 
     def heater_block(ok):
         """The active safety condition keeping the heater off, or None (None removes the key)."""
         if not ok:
             return "sensor_fault"
-        if sensor.temp_c >= config.TEMP_MAX_C:
+        hot = tm.hottest()
+        if (sensor.temp_c if hot is None else hot) >= config.TEMP_MAX_C:
             return "over_temperature"
         if out.heater.latched:
             return out.heater.latched
@@ -251,12 +264,15 @@ def main():
         machine = tm.machine_status()
         net = network_status() or {}  # empty when netwatch is not running: the keys are then removed
         # a new task may start while cooling once the machine is cool enough to accept it
-        cool_enough = ok and sensor.temp_c < config.TEMP_MAX_C - config.TEMP_RESUME_DROP
+        hot = tm.hottest()
+        cool_enough = ok and (sensor.temp_c if hot is None else hot) < config.TEMP_MAX_C - config.TEMP_RESUME_DROP
         return {
             "fan": out.fan.is_active,
             "heater": out.heater.is_active,
+            # temp and sensor_ok are the bottom sensor (sensor 1), as they always were
             "temp": round(sensor.temp_c, 1) if ok else None,  # None removes the key
             "sensor_ok": ok,
+            **zone_state(zones),
             "temp_max": config.TEMP_MAX_C,
             "status": machine,
             "cooling": tm.cooling_active(),
@@ -268,7 +284,8 @@ def main():
             "settings_updated_at": tm.settings.updated_at,
             "manual_heating": manual.enabled,
             "heater_block": heater_block(ok),
-            "ready": machine in ("ready", "cooling") and cool_enough and not out.heater.is_active,
+            "ready": (machine in ("ready", "cooling") and cool_enough and not out.heater.is_active
+                      and zones.configured()),
             "command_id": manual.last_command_id,         # None removes the key
             "command_source": manual.last_command_source,
             "command_at": manual.last_command_at,
@@ -306,19 +323,24 @@ def main():
     tm.server_now_ms = sync.server_clock.now_ms  # command age is judged on server time, not the Pi clock
 
     # get a first reading before the recovery check starts
-    sensor.poll()
+    for s in zones.sensors.values():
+        s.poll()
     store.log_event("device_started", "device started", data={
         "boot_changed": prev_boot != boot_id, "previous_boot_id": prev_boot,
         "clean_shutdown": clean, "clock_synced": clock_synced(),
+        "sensor_offsets_c": offsets, "zones_unconfigured": zones.unconfigured(),
     })
     tm.startup(prev_boot, clean)
 
-    def read_sensor():
-        # the 1-Wire read takes about a second, so it must not hold up command handling
+    def read_sensor(s):
+        # the 1-Wire read takes about a second, so it must not hold up command handling. One thread per
+        # sensor: read one after another the three would take sensor 1 past DWELL_MAX_GAP_SECONDS, and a
+        # slow or dead upper sensor must never delay the one that holds the heater thermostat.
         while not stop.wait(config.SENSOR_INTERVAL):
-            sensor.poll()
+            s.poll()
 
-    threading.Thread(target=read_sensor, daemon=True, name="sensor").start()
+    for zone, s in zones.sensors.items():
+        threading.Thread(target=read_sensor, args=(s,), daemon=True, name=f"sensor-{zone}").start()
     threading.Thread(target=sync.run, args=(stop,), daemon=True, name="cloud-sync").start()
     api = LocalApi(get_snapshot=lambda: snapshot["value"] and dict(
         snapshot["value"], loop_age_s=round(time.monotonic() - last_tick["at"], 2)),

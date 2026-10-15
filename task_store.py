@@ -25,9 +25,15 @@ TASK_MIGRATIONS = {
     "warmup_timeout_s": "REAL",
     "dip_limit_s": "REAL",
     "max_temp_c": "REAL",
+    # three-zone warm-up. Optional on purpose: a task saved by older firmware has none of them and keeps
+    # warming on the bottom sensor alone, as it was accepted.
+    "floor_middle_c": "REAL",
+    "floor_top_c": "REAL",
+    "bypass_zones": "TEXT",     # comma list of zones the operator started without, e.g. "top"
 }
 SNAPSHOT_FIELDS = ("target_c", "tolerance_c", "hysteresis_c", "dwell_s", "median_window",
                    "warmup_timeout_s", "dip_limit_s", "max_temp_c")
+OPTIONAL_SNAPSHOT_FIELDS = ("floor_middle_c", "floor_top_c", "bypass_zones")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -92,20 +98,10 @@ CREATE TABLE IF NOT EXISTS temp_log (
     mono REAL NOT NULL,
     raw_c REAL NOT NULL,
     smoothed_c REAL NOT NULL,
-    phase TEXT NOT NULL
+    phase TEXT NOT NULL,
+    zone TEXT NOT NULL DEFAULT 'bottom'
 );
 CREATE INDEX IF NOT EXISTS temp_log_task ON temp_log (task_id, wall);
-CREATE TABLE IF NOT EXISTS temp_minutes (
-    task_id TEXT NOT NULL,
-    minute INTEGER NOT NULL,
-    n INTEGER NOT NULL,
-    sum_c REAL NOT NULL,
-    min_c REAL NOT NULL,
-    max_c REAL NOT NULL,
-    raw_last REAL NOT NULL,
-    uploaded INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (task_id, minute)
-);
 CREATE TABLE IF NOT EXISTS task_excursions (
     task_id TEXT NOT NULL,
     start_wall REAL NOT NULL,
@@ -114,6 +110,21 @@ CREATE TABLE IF NOT EXISTS task_excursions (
     PRIMARY KEY (task_id, start_wall)
 );
 """
+
+
+TEMP_MINUTES_SQL = """
+CREATE TABLE temp_minutes (
+    task_id TEXT NOT NULL,
+    zone TEXT NOT NULL DEFAULT 'bottom',
+    minute INTEGER NOT NULL,
+    n INTEGER NOT NULL,
+    sum_c REAL NOT NULL,
+    min_c REAL NOT NULL,
+    max_c REAL NOT NULL,
+    raw_last REAL NOT NULL,
+    uploaded INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (task_id, zone, minute)
+)"""
 
 
 def _row(cur_row):
@@ -137,6 +148,7 @@ class TaskStore:
         self._local = threading.local()
         with self._conn() as c:
             c.executescript(SCHEMA)
+            self._ensure_temp_minutes(c)
             # databases created before completed_rows existed
             cols = [r["name"] for r in c.execute("PRAGMA table_info(tasks)")]
             if "completed_rows" not in cols:
@@ -144,6 +156,24 @@ class TaskStore:
             for name, sql_type in TASK_MIGRATIONS.items():
                 if name not in cols:
                     c.execute(f"ALTER TABLE tasks ADD COLUMN {name} {sql_type}")
+            # databases created before the middle and top sensors: every sample so far is the bottom sensor's
+            if "zone" not in [r["name"] for r in c.execute("PRAGMA table_info(temp_log)")]:
+                c.execute("ALTER TABLE temp_log ADD COLUMN zone TEXT NOT NULL DEFAULT 'bottom'")
+
+    @staticmethod
+    def _ensure_temp_minutes(c):
+        cols = [r["name"] for r in c.execute("PRAGMA table_info(temp_minutes)")]
+        if not cols:
+            c.execute(TEMP_MINUTES_SQL)
+        elif "zone" not in cols:
+            # one-time rebuild, atomic: the key now includes the zone and every existing row is the bottom's
+            c.execute("BEGIN IMMEDIATE")
+            c.execute("ALTER TABLE temp_minutes RENAME TO temp_minutes_old")
+            c.execute(TEMP_MINUTES_SQL)
+            c.execute(
+                "INSERT INTO temp_minutes(task_id, zone, minute, n, sum_c, min_c, max_c, raw_last, uploaded) "
+                "SELECT task_id, 'bottom', minute, n, sum_c, min_c, max_c, raw_last, uploaded FROM temp_minutes_old")
+            c.execute("DROP TABLE temp_minutes_old")
 
     # ---------------- connection ----------------
     def _conn(self):
@@ -212,16 +242,18 @@ class TaskStore:
                     mode=None, snapshot=None):
         """Insert a new task as 'starting'. Raises sqlite3.IntegrityError on a duplicate id.
 
-        `snapshot` holds the SNAPSHOT_FIELDS values the session runs with from now on.
+        `snapshot` holds the SNAPSHOT_FIELDS values the session runs with from now on, plus the
+        OPTIONAL_SNAPSHOT_FIELDS (zone floors, bypassed zones) when there are any.
         """
         snapshot = snapshot or {}
+        fields = SNAPSHOT_FIELDS + OPTIONAL_SNAPSHOT_FIELDS
         with self._conn() as c:
             c.execute(
                 "INSERT INTO tasks(task_id, weight_kg, batch_count, row_levels, duration_s, status, "
-                "accepted_wall, seq, mode, " + ", ".join(SNAPSHOT_FIELDS) + ") "
-                "VALUES(?, ?, ?, ?, ?, 'starting', ?, 1, ?" + ", ?" * len(SNAPSHOT_FIELDS) + ")",
+                "accepted_wall, seq, mode, " + ", ".join(fields) + ") "
+                "VALUES(?, ?, ?, ?, ?, 'starting', ?, 1, ?" + ", ?" * len(fields) + ")",
                 (task_id, weight_kg, batch_count, row_levels, duration_s, self._wall(), mode,
-                 *(snapshot.get(k) for k in SNAPSHOT_FIELDS)),
+                 *(snapshot.get(k) for k in fields)),
             )
             if event:
                 self._insert_event(c, *event[:2], task_id=task_id, data=event[2] if len(event) > 2 else None)
@@ -291,41 +323,59 @@ class TaskStore:
 
     # ---------------- temperature log ----------------
     def append_temp_samples(self, rows):
-        """rows: (task_id, wall, mono, raw_c, smoothed_c, phase). Also folds them into minute summaries."""
+        """rows: (task_id, wall, mono, raw_c, smoothed_c, phase[, zone]). Also folds them into minute summaries.
+
+        A row without a zone is the bottom sensor's, which is what every caller wrote before there were three.
+        """
         if not rows:
             return
+        rows = [tuple(r) + ("bottom",) if len(r) == 6 else tuple(r) for r in rows]
         with self._conn() as c:
             c.executemany(
-                "INSERT INTO temp_log(task_id, wall, mono, raw_c, smoothed_c, phase) VALUES(?, ?, ?, ?, ?, ?)",
+                "INSERT INTO temp_log(task_id, wall, mono, raw_c, smoothed_c, phase, zone) VALUES(?, ?, ?, ?, ?, ?, ?)",
                 rows)
             c.executemany(
-                "INSERT INTO temp_minutes(task_id, minute, n, sum_c, min_c, max_c, raw_last, uploaded) "
-                "VALUES(?, ?, 1, ?, ?, ?, ?, 0) "
-                "ON CONFLICT(task_id, minute) DO UPDATE SET n=n+1, sum_c=sum_c+excluded.sum_c, "
+                "INSERT INTO temp_minutes(task_id, zone, minute, n, sum_c, min_c, max_c, raw_last, uploaded) "
+                "VALUES(?, ?, ?, 1, ?, ?, ?, ?, 0) "
+                "ON CONFLICT(task_id, zone, minute) DO UPDATE SET n=n+1, sum_c=sum_c+excluded.sum_c, "
                 "min_c=min(min_c, excluded.min_c), max_c=max(max_c, excluded.max_c), "
                 "raw_last=excluded.raw_last, uploaded=0",
-                [(t, int(w // 60), s, s, s, raw) for t, w, _m, raw, s, _p in rows])
+                [(t, z, int(w // 60), s, s, s, raw) for t, w, _m, raw, s, _p, z in rows])
 
-    def temp_log(self, task_id):
-        return [dict(r) for r in self._conn().execute(
-            "SELECT * FROM temp_log WHERE task_id=? ORDER BY wall, rowid", (task_id,))]
+    def temp_log(self, task_id, zone=None):
+        """Every logged sample of a task, oldest first; one zone's only when `zone` is given."""
+        q, args = "SELECT * FROM temp_log WHERE task_id=?", [task_id]
+        if zone is not None:
+            q, args = q + " AND zone=?", args + [zone]
+        return [dict(r) for r in self._conn().execute(q + " ORDER BY wall, rowid", args)]
 
     def temp_minutes(self, task_id):
-        """Per-minute summaries for one task, oldest first (what task_logs/ holds in Firebase)."""
+        """Per-minute summaries for one task, oldest first, one row per zone (see snapshot.minute_entries)."""
         return [dict(r) for r in self._conn().execute(
-            "SELECT minute, n, sum_c, min_c, max_c, raw_last FROM temp_minutes WHERE task_id=? ORDER BY minute",
-            (task_id,))]
+            "SELECT zone, minute, n, sum_c, min_c, max_c, raw_last FROM temp_minutes WHERE task_id=? "
+            "ORDER BY minute, zone", (task_id,))]
 
     def pending_temp_minutes(self, limit=100):
+        """Zone-minute rows not uploaded yet (or changed since), oldest first."""
         return [dict(r) for r in self._conn().execute(
-            "SELECT * FROM temp_minutes WHERE uploaded=0 ORDER BY task_id, minute LIMIT ?", (limit,))]
+            "SELECT * FROM temp_minutes WHERE uploaded=0 ORDER BY task_id, minute, zone LIMIT ?", (limit,))]
+
+    def temp_minute_rows(self, keys):
+        """Every zone's row for each (task_id, minute), so a minute is always uploaded whole."""
+        rows = []
+        for task_id, minute in keys:
+            rows += [dict(r) for r in self._conn().execute(
+                "SELECT * FROM temp_minutes WHERE task_id=? AND minute=? ORDER BY zone", (task_id, minute))]
+        return rows
 
     def mark_temp_minutes_uploaded(self, items):
-        """items: (task_id, minute, n). A minute that gained samples meanwhile stays pending."""
+        """items: (task_id, minute, n[, zone]). A minute that gained samples meanwhile stays pending."""
         if not items:
             return
+        items = [(i[0], i[1], i[2], i[3] if len(i) > 3 else "bottom") for i in items]
         with self._conn() as c:
-            c.executemany("UPDATE temp_minutes SET uploaded=1 WHERE task_id=? AND minute=? AND n=?", items)
+            c.executemany(
+                "UPDATE temp_minutes SET uploaded=1 WHERE task_id=? AND minute=? AND n=? AND zone=?", items)
 
     # ---------------- temperature excursions ----------------
     def save_excursion(self, task_id, start_wall, end_wall, min_c):

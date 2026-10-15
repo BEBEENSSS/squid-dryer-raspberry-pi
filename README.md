@@ -1,6 +1,6 @@
 # Squid dryer controller (Raspberry Pi)
 
-`dryer_cloud.py` runs the dryer: relays on GPIO17 (fan) and GPIO27 (heater, both active low), and a DS18B20 sensor on 1-Wire.
+`dryer_cloud.py` runs the dryer: relays on GPIO17 (fan) and GPIO27 (heater, both active low), and three DS18B20 sensors on 1-Wire, one per bus (see "Temperature sensors" below).
 The Pi is the authority on what the machine is actually doing. Firebase is used for commands and for showing state.
 **Once a drying task is accepted, the Pi does not need the internet to finish it.**
 
@@ -8,11 +8,12 @@ The Pi is the authority on what the machine is actually doing. Firebase is used 
 |---|---|
 | `dryer_cloud.py` | Entry point: control loop, manual fan/heater mode, signals |
 | `task_manager.py` | Drying task state machine, timer, thermostat, safety faults |
-| `warmup.py` | Pure target-temperature detection (moving median + dwell) and dip tracking |
+| `warmup.py` | Pure target-temperature detection (moving median + dwell, across all three zones) and dip tracking |
+| `calibration.py` | Per-sensor offsets written by `sensor2_test.py --calibrate` and applied to the middle and top sensors |
 | `recovery.py` | Decision after a restart: resume / failed / recovery required |
 | `task_store.py` | SQLite record (`data/dryer.db`): tasks, temperature log, event outbox, processed commands |
 | `cloud_sync.py` | Background Firebase thread: command stream + polling, heartbeat, event upload |
-| `hardware.py` | Relays and sensor reading (unchanged logic) |
+| `hardware.py` | Relays, sensor reading, and `SensorArray` (the three chamber sensors by zone) |
 | `local_api.py` | Local HTTP API and the web panel, so the machine works from a phone with no internet |
 | `netwatch.py`, `net_policy.py` | Own service: home Wi-Fi first, hotspot as fallback (`net_policy.py` is the pure decision logic) |
 | `command_age.py` | Pure rules for rejecting old cloud commands |
@@ -37,19 +38,20 @@ restart while active ─▶ recovering ─┬─▶ warming_up         (was warm
 ```
 
 - The task row is committed to SQLite as `starting` and then `warming_up` **before** the heater can switch on.
-- **Warm-up, then drying.** A task starts `warming_up`: the heater runs under the thermostat but the drying timer does not. Each valid sensor reading (every `SENSOR_INTERVAL` s) goes through a moving median over `MEDIAN_WINDOW` samples (`warmup.py`). The target counts as reached only when that smoothed value stays at or above `target − TARGET_TOLERANCE_C` continuously for `DWELL_SECONDS`. Falling out of the band, or a missing sample (more than `DWELL_MAX_GAP_SECONDS` between readings), restarts the dwell, and a failed read is never treated as "reached". On confirmation the task becomes `running`, and `drying_started` is **backdated to the first sample of the qualifying dwell**; `target_confirmed` is when the dwell finished. The default tolerance (2.5 C) is deliberately wider than `TASK_HYSTERESIS_C` (2 C): otherwise the thermostat's own heater cycling would keep dropping the chamber out of the band.
+- **Warm-up, then drying.** A task starts `warming_up`: the heater runs under the thermostat but the drying timer does not. Each valid sensor reading (every `SENSOR_INTERVAL` s) goes through a moving median over `MEDIAN_WINDOW` samples (`warmup.py`). **Every zone (bottom, middle, top) has its own median and its own band.** The target counts as reached only when all of them are in their band at the same time and the last one to get there has stayed for `DWELL_SECONDS`; a zone's band floor is `target − TARGET_TOLERANCE_C − ZONE_FLOOR_ALLOWANCE_C[zone]` (the allowance is 0 by default, and the bottom never has one). Falling out of the band, or a missing sample (more than `DWELL_MAX_GAP_SECONDS` between readings) in any zone, restarts the dwell, and a failed read is never treated as "reached". On confirmation the task becomes `running`, and `drying_started` is **backdated to the first sample at which all zones were in band**; `target_confirmed` is when the dwell finished. The default tolerance (2.5 C) is deliberately wider than `TASK_HYSTERESIS_C` (2 C): otherwise the thermostat's own heater cycling would keep dropping the chamber out of the band. The thermostat itself still reads sensor 1 (bottom) only, so the upper zones may lag it: see "Temperature sensors" for how to tune the floors.
 - **Timestamps** (all from the Pi's clock): `started_wall` = session start, `drying_started_wall`, `target_confirmed_wall`, `ended_wall`. Warm-up time = `drying_started − session_started`; drying time = `(ended or now) − drying_started`. The configured `duration_minutes` is always the full drying duration: warm-up is recorded next to it and never added or subtracted.
 - **Completion is unchanged** (duration reached, last `complete_batch`, cancel, faults), except that the duration is measured from `drying_started`. Experiments (`mode: "experiment"`, sent with the 10080 min ceiling) still end only through `complete_batch` or cancel. `mode` is recorded for audit and does not change behaviour.
 - **Warm-up timeout:** if the target is not confirmed within `WARMUP_TIMEOUT_SECONDS` (powered-on time, kept across restarts) the task fails with `warmup_timeout` and the heater turns off.
 - **Dips while drying:** if the smoothed temperature leaves the band after drying started, the timer keeps running. Each excursion `{start, end, min}` is stored (`task_excursions`) and reported in `dips`; one longer than `DIP_WARNING_LIMIT_SECONDS` sets `dip_warning` and logs `dip_warning`, without stopping anything.
-- **Frozen settings:** `target_c`, `tolerance_c`, `hysteresis_c`, `dwell_s`, `median_window`, `warmup_timeout_s`, `dip_limit_s` and `max_temp_c` are copied onto the task when it is accepted, and the thermostat, detection and faults all use that copy. Editing `config.py` never changes a running session. A task whose frozen settings are missing or invalid fails as `invalid_session` and the heater stays off. Tasks saved by older firmware get their settings frozen at the first start after the upgrade and keep their original clock.
-- **Safety nets:** the relays default to off at boot, in the `finally` of the main loop, and whenever the control tick raises (`controller_error` is logged and the heater forced off before the exception propagates). Reaching `MAX_TEMP_CUTOFF_C` (`min(target + 10, TEMP_MAX_C)`) fails the task and cuts the heater in software, independent of Firebase. A sensor failure (`SENSOR_BAD_LIMIT` consecutive bad reads, or no valid reading for `SENSOR_STALE_SECONDS`) fails the task. A reading outside `TEMP_PLAUSIBLE_MIN_C`..`TEMP_PLAUSIBLE_MAX_C` counts as a failed read.
-- **Temperature log:** every valid reading (raw and smoothed, with phase `warming_up` or `drying`) is written to the `temp_log` table of the local database for the whole session, flushed with each checkpoint. Per-minute summaries (`temp_minutes`) are uploaded to `task_logs/{task_id}/{minute}` every `TEMP_LOG_UPLOAD_SECONDS`, in the same write as the events, so they queue up offline and sync when Wi-Fi returns.
+- **Frozen settings:** `target_c`, `tolerance_c`, `hysteresis_c`, `dwell_s`, `median_window`, `warmup_timeout_s`, `dip_limit_s`, `max_temp_c` and the middle and top band floors (`floor_middle_c`, `floor_top_c`) are copied onto the task when it is accepted, and the thermostat, detection and faults all use that copy. The two floors are optional: a task saved before the zones existed has none and warms on the bottom sensor alone, as it was accepted. Editing `config.py` never changes a running session. A task whose frozen settings are missing or invalid fails as `invalid_session` and the heater stays off. Tasks saved by older firmware get their settings frozen at the first start after the upgrade and keep their original clock.
+- **Safety nets:** the relays default to off at boot, in the `finally` of the main loop, and whenever the control tick raises (`controller_error` is logged and the heater forced off before the exception propagates). Reaching `MAX_TEMP_CUTOFF_C` (`min(target + 10, TEMP_MAX_C)`) **on any healthy sensor** fails the task and cuts the heater in software, independent of Firebase. A sensor 1 failure (`SENSOR_BAD_LIMIT` consecutive bad reads, or no valid reading for `SENSOR_STALE_SECONDS`) fails the task (`sensor_failure`). A middle or top sensor failing **during warm-up** fails it too (`zone_sensor_failure`, heater off), because warm-up cannot be confirmed without it; **while drying** it only logs `zone_sensor_fault` (and `zone_sensor_restored`), sets `state/sensor_middle_ok` or `sensor_top_ok` to false, and drying carries on under sensor 1's thermostat. A reading outside `TEMP_PLAUSIBLE_MIN_C`..`TEMP_PLAUSIBLE_MAX_C` counts as a failed read.
+- **Temperature log:** every valid reading of every sensor (raw and smoothed, with phase `warming_up` or `drying` and its `zone`) is written to the `temp_log` table of the local database for the whole session, flushed with each checkpoint. Per-minute summaries (`temp_minutes`, one row per zone) are uploaded to `task_logs/{task_id}/{minute}` every `TEMP_LOG_UPLOAD_SECONDS`, in the same write as the events, so they queue up offline and sync when Wi-Fi returns. The bottom sensor's summary stays flat in the entry, exactly as with one sensor; the middle and top ones are `middle` / `top` sub-objects. A minute is always written whole, from every zone's row. `TEMP_LOG_BATCH` counts zone-minute rows.
+- **Warm-up progression:** the first time each zone enters its band during warm-up a `warmup_zone_reached` event is logged (`zone`, `smoothed_c`, `floor_c`, `warmup_s`), so the order and timing of the heat climbing the box can be read straight from the events.
 - **Timer:** only time actually spent running counts. Elapsed time comes from the monotonic clock and is saved every `CHECKPOINT_SECONDS`. After a restart the timer continues from the last saved value. It never restarts from zero, and downtime is never counted as drying time. At worst, one checkpoint interval (10 s) of drying gets repeated.
 - **Thermostat during a task:** heater on at ≤ `TASK_SETPOINT_C − TASK_HYSTERESIS_C`, off at ≥ `TASK_SETPOINT_C`, fan always on. `TEMP_MAX_C` stays the hard cutoff.
 - **Losing the internet never fails a task.** A sensor failure (3 bad reads or 10 s without a valid reading) or reaching `TEMP_MAX_C` turns the heater off and marks the task `failed`. The machine then cools (below).
 - **Confirming a batch dry (`complete_batch`):** frees one row. The other rows keep drying and the schedule is unchanged. When the last row is freed the task ends `completed`.
-- **Cooling:** whenever a task ends (completed, cancelled, failed) the heater turns off immediately and the fan keeps running while the measured temperature is above the safe shutdown temperature. Once it is at or below, the fan turns off and the status goes back to `ready`. The safe temperature comes from `settings/safe_temp_c` (25–50 °C), is saved in the local database and survives reboots and outages; the default is `COOLDOWN_SAFE_TEMP_C`. Cooling stops after `COOLDOWN_MAX_SECONDS`, or `COOLDOWN_NO_SENSOR_SECONDS` if the sensor is dead. A reboot while hot also starts cooling. A new task can start during cooling once it is below the `too_hot` limit, and manual fan/heater commands are ignored (and reset) while cooling. Everything runs locally, with no internet needed.
+- **Cooling:** whenever a task ends (completed, cancelled, failed) the heater turns off immediately and the fan keeps running while the measured temperature is above the safe shutdown temperature (the **hottest healthy sensor** decides, so the fan runs until the whole box is safe). Once it is at or below, the fan turns off and the status goes back to `ready`. The safe temperature comes from `settings/safe_temp_c` (25–50 °C), is saved in the local database and survives reboots and outages; the default is `COOLDOWN_SAFE_TEMP_C`. Cooling stops after `COOLDOWN_MAX_SECONDS`, or `COOLDOWN_NO_SENSOR_SECONDS` if the sensor is dead. A reboot while hot also starts cooling. A new task can start during cooling once it is below the `too_hot` limit, and manual fan/heater commands are ignored (and reset) while cooling. Everything runs locally, with no internet needed.
 - A `failed` task blocks new starts until the web app sends `acknowledge`. Nothing ever restarts heating on its own after a failure.
 - **Manual mode** (`commands/fan`, `commands/heater`): `commands/heater = true` means manual heating is enabled. The Pi then holds `settings/manual_target_temp_c` itself (heater off at the target, back on 2 C below it, `MANUAL_HYSTERESIS_C`) and keeps doing so with no internet. The old 600 s auto-off and 120 s offline cut are gone. After a boot the heater stays blocked until the operator re-enables it. Over temperature (`TEMP_MAX_C`), a failed sensor or a stopped fan still switch manual heating off and reset `commands/heater`. Ignored while a task is active or waiting for recovery.
 - **Heater cut-off** (`settings/heater_cutoff_c`, 30-58 C): in manual mode and during tasks the heater turns off at or above this temperature and is allowed again at `HEATER_CUTOFF_MARGIN_C` (3 C) below it. This only pauses heating: timers, fan, sensor monitoring and status keep running. It is separate from the `TEMP_MAX_C` fault, which still fails a task and cuts the heater, and from the sensor-failure fault.
@@ -107,6 +109,8 @@ The rules are checked in this order:
 | `WARMUP_TIMEOUT_SECONDS` | 10800 | target not confirmed by then → `warmup_timeout`, heater off |
 | `DIP_WARNING_LIMIT_SECONDS` | 600 | a dip below the band this long during drying sets `dip_warning` |
 | `MAX_TEMP_CUTOFF_C` | 60 | software over-temperature fault: `min(target + 10, TEMP_MAX_C)` |
+| `ZONE_SENSOR_IDS` | sensor 1's id + two placeholders | 1-Wire id of the bottom, middle and top sensor. **While the middle or top id is a placeholder every start is rejected (`zones_unconfigured`)** |
+| `ZONE_FLOOR_ALLOWANCE_C` | middle 0, top 0 | extra degrees a zone may sit below the shared band floor and still count as warm. Frozen per task when it starts |
 | `TEMP_PLAUSIBLE_MIN_C` / `MAX_C` | −10 / 100 | readings outside this count as failed reads |
 | `TEMP_LOG_UPLOAD_SECONDS`, `TEMP_LOG_BATCH` | 60, 500 | per-minute temperature summaries to Firebase |
 | `COOLDOWN_SAFE_TEMP_C` | 40 | default cooldown temperature; the web app can change it (`settings/safe_temp_c`, 25–50) |
@@ -117,6 +121,33 @@ The rules are checked in this order:
 | `TEMP_PLAUSIBLE_MIN_C`, `_MAX_C` | -10, 100 | a reading outside this range counts as a failed read, which turns the heater off |
 | `MAX_BATCH_COUNT`, `MIN/MAX_DURATION_MIN` | 100, 1–10080 | start validation, same limits as `database.rules.json` |
 | `ALLOWED_ROW_LEVELS`, `MAX_WEIGHT_KG` | 1–4, 20 | **placeholders, set them for the machine**. Weight is only checked when sent |
+
+## Temperature sensors (three zones)
+
+| Zone | Sensor | GPIO | Where | Used for |
+|---|---|---|---|---|
+| `bottom` | 1 | 4 | bottom of the box, near the intake fan and the heater | the **reference** for calibration, and the only sensor the thermostat, the heater interlock, the runtime guard and restart recovery read |
+| `middle` | 2 | 22 | middle of the box | warm-up, over-temperature, cooldown, display |
+| `top` | 3 | 23 | top of the box | warm-up, over-temperature, cooldown, display |
+
+Which sensor decides what:
+
+- **Warm-up:** all three zones (see "Warm-up, then drying"). The heater is still controlled from sensor 1, so the upper zones follow it up the box.
+- **Over-temperature** (task fault, manual mode, `heater_block`), the `too_hot` start check, `state/ready` and **cooldown:** the hottest healthy sensor.
+- **Dip tracking while drying:** sensor 1 only.
+- A sensor that is not healthy (`SENSOR_BAD_LIMIT` bad reads in a row, or nothing valid for `SENSOR_STALE_SECONDS`) is left out of the "hottest" reading, but a failing **sensor 1** still stops everything, as before.
+
+**Wiring and set-up.** Each sensor is on its own 1-Wire bus with its own 4.7 k pull-up to 3V3: add one `dtoverlay=w1-gpio,gpiopin=<pin>` line per pin (4, 22 and 23) to `/boot/firmware/config.txt` and reboot. The bus numbers (`w1_bus_master1`, ...) can swap between boots, so the service goes by **sensor id**, never by bus. Put the real ids in `ZONE_SENSOR_IDS` in `config.py`:
+
+1. `python sensor2_test.py --expect 3` lists the three ids (it also fails loudly if one is missing).
+2. Warm one sensor with your hand while it runs: the column that rises tells you which id it is. Do this once, because software cannot tell a swapped middle and top apart.
+3. Until both are real ids, `state/zones_configured` is false and every start is rejected as `zones_unconfigured`; the service logs a `config_warning` event at start-up.
+
+**Calibration.** `python sensor2_test.py --calibrate` (sensors side by side) matches each extra sensor to sensor 1 and saves one offset per sensor id in `data/sensor2_calibration.json`. The service applies those offsets to the middle and top sensors when it starts (listed in the `device_started` event); **restart `squid-dryer.service` after recalibrating**. Sensor 1 is never offset, whatever the file says.
+
+**Starting without a sensor.** If the middle or top sensor is not reading, a start is rejected (`zone_sensor_unavailable`) unless the operator sends `bypass_zones` for it, which the web app offers after a warning. The bypassed zone is ignored when judging warm-up. Sensor 1 cannot be bypassed.
+
+**Tuning the zone floors.** The thermostat holds sensor 1 at about `TASK_SETPOINT_C` (53 to 55 C), and the upper zones lag it, so with `ZONE_FLOOR_ALLOWANCE_C` at 0 a top that never gets within `TARGET_TOLERANCE_C` (2.5 C) of that would sit in warm-up until `warmup_timeout`. Do a cold run and read the `warmup_zone_reached` events and the `zones` in `task/report` (or `temp_log` per zone in `data/dryer.db`). If a zone settles below its floor, raise its allowance by that shortfall plus a little margin, restart the service, and keep in mind that this starts drying while that zone is cooler. A task already running keeps the floors it started with.
 
 ## Firebase schema (`devices/squid-dryer/...`)
 
@@ -133,10 +164,13 @@ The schema follows the web app. Security rules are in `database.rules.json`. The
   "row_levels": "1,3",
   "weight_kg": 2.5,
   "mode": "standard",
+  "bypass_zones": "top",
   "requested_by": "<uid>",
   "requested_at": {".sv": "timestamp"}
 }
 ```
+
+`bypass_zones` (optional, `start` only; `"middle"`, `"top"` or `"middle,top"`) is the operator starting **without** a middle or top sensor that is not reading, after being warned. A start is rejected `zone_sensor_unavailable` when one of those sensors is unhealthy and not listed here. The bypassed zones are ignored when judging warm-up (they are still read and logged if they work) and are recorded on the task. Sensor 1 (bottom) can never be bypassed (`invalid_bypass_zones`), and `zones_unconfigured` cannot be bypassed either.
 
 - `command` is one of these:
   - `start`
@@ -157,17 +191,19 @@ The schema follows the web app. Security rules are in `database.rules.json`. The
 **The Pi writes** (the web app only reads these):
 
 - `task/ack`: `{command_id, command, task_id, result: accepted|rejected|duplicate, reason, at}`. The request has been processed once `task/ack.command_id` equals your `command_id`, or `"<task_id>:<command>:<requested_at>"` when you don't send one. Read `requested_at` back from `task/request` to get the resolved server time. Until then it has **not been processed yet**. `reason` explains a rejection, e.g. `too_hot`, `invalid_row_levels`, `unacknowledged_failure`.
-- `task/report`: `{task_id, status, seq, boot_id, started_at, drying_started_at, target_confirmed_at, ended_at, warmup_seconds, mode, target_temp_c, tolerance_c, dwell_seconds, warmup_timeout_seconds, smoothed_temp_c, dips, dip_count, dip_warning, duration_minutes, elapsed_seconds, remaining_seconds, progress_percent, batch_count, row_levels, weight_kg, completed_rows, reason, detail, acknowledged, batches, reported_at}`
+- `task/report`: `{task_id, status, seq, boot_id, started_at, drying_started_at, target_confirmed_at, ended_at, warmup_seconds, mode, target_temp_c, tolerance_c, dwell_seconds, warmup_timeout_seconds, smoothed_temp_c, zones, bypass_zones, dips, dip_count, dip_warning, duration_minutes, elapsed_seconds, remaining_seconds, progress_percent, batch_count, row_levels, weight_kg, completed_rows, reason, detail, acknowledged, batches, reported_at}`
+  - `smoothed_temp_c` is still the bottom sensor's. `zones` (live session only) is `{bottom|middle|top: {smoothed_temp_c, floor_c, in_band, bypassed}}`: each zone's moving-median reading, its frozen band floor, whether it is in band right now, and `true` when the operator started without it. `bypass_zones` is the comma list that was bypassed (absent when none).
   - `started_at` is the session start (warm-up began). `drying_started_at` is absent while warming up. `elapsed_seconds`, `remaining_seconds` and `progress_percent` count **drying** time only and stay 0 / full / 0 while warming up. Batch `offset_seconds` is measured from the drying start.
   - `dips` lists up to the last 20 excursions below the band, `{start, end, min_temp_c}` (epoch ms, `end` absent while one is open).
-- `task_logs/{task_id}/{minute}`: `{t, avg, min, max, raw, n}`, one per minute of the session (smoothed average/min/max, last raw reading, sample count). The full-resolution log stays in the Pi's `temp_log` table.
+- `task_logs/{task_id}/{minute}`: `{t, avg, min, max, raw, n, middle, top}`, one per minute of the session (smoothed average/min/max, last raw reading, sample count). The flat keys are the bottom sensor's; `middle` and `top` are `{avg, min, max, raw, n}` sub-objects, absent for a minute in which that sensor gave no reading. The full-resolution log stays in the Pi's `temp_log` table.
   - `batches` lists the batches added with `add_batch`: `{batch_id, row_level, offset_seconds, duration_minutes, elapsed_seconds, remaining_seconds, progress_percent}`. Each is measured from when it was added. `[]` when none were added.
   - `status` is `starting`, `warming_up`, `running`, `completed`, `cancelled`, `failed`, `recovering` or `recovery_required`.
-  - `reason` is set for failures and recovery holds, e.g. `possible_power_loss`, `warmup_timeout`, `invalid_session`.
+  - `reason` is set for failures and recovery holds, e.g. `possible_power_loss`, `warmup_timeout`, `invalid_session`, `zone_sensor_failure` (a middle or top sensor stopped reading during warm-up). Start rejections added with the zones: `zones_unconfigured`, `zone_sensor_unavailable`, `invalid_bypass_zones`.
   - `detail` is a short readable summary. The full diagnostics are in `events`.
   - `seq` increases with every change.
 - `state/status`: `ready`, `starting`, `warming_up`, `running`, `cooling`, `recovering`, `recovery_required` or `failed` (a failure not yet acknowledged). `state/ready` is true when a new task can be started.
-- `state/fan`, `heater`, `temp`, `sensor_ok`, `temp_max`, `last_event`, `boot_id`, `pending_events` (events still waiting to upload)
+- `state/fan`, `heater`, `temp`, `sensor_ok`, `temp_max`, `last_event`, `boot_id`, `pending_events` (events still waiting to upload). `temp` and `sensor_ok` are the **bottom** sensor (sensor 1), as they always were.
+- `state/temp_middle`, `temp_top` (removed while that sensor is unhealthy), `sensor_middle_ok`, `sensor_top_ok`, and `zones_configured` (false while a sensor id in `config.py` is still a placeholder; every start is then rejected and `ready` is false).
 - `network/ack`: `{command_id, mode, result: accepted|rejected, reason, at}`. `accepted` means the request was handed to netwatch, **not** that the radio has switched: the switch starts `NET_SWITCH_DELAY_SECONDS` later, and when the Pi leaves the home Wi-Fi it can no longer report anything. `reason` for a rejection: `stale_command`, `superseded_by_local`, `unverifiable` (the Pi could not prove the request was recent), `already_in_mode`, `netwatch_unavailable`, `write_failed` or `invalid`.
 - `state/network`: `wifi`, `hotspot` or `connecting`, as last reported by netwatch (removed when netwatch is not running). While the Pi is on its hotspot it has no route to Firebase, so `hotspot` is only ever seen locally; the cloud sees `last_seen` stop and, later, `wifi` again.
 - `state/network_since` (epoch ms, Pi clock), `state/network_reason` (why the machine is in this mode: `boot`, `requested`, `fallback`, `no_client_timeout`, `clients_left`, `switched_back` or `wifi_back`), `state/hotspot_connect_timeout_s`, `state/hotspot_empty_grace_s`.

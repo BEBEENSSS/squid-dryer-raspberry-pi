@@ -14,20 +14,21 @@ Calibration: put all sensors side by side, let them settle, then
     python sensor2_test.py --calibrate           # match every extra sensor to the main one (120 s)
     python sensor2_test.py --calibrate --true-temp 47.0   # match them to a trusted thermometer instead
 The offsets are saved to data/sensor2_calibration.json, one per sensor id, and applied by this
-script from then on (--raw shows the uncalibrated readings). The dryer service does not read it.
+script from then on (--raw shows the uncalibrated readings). The dryer service applies the same
+offsets to the middle and top sensors (never to sensor 1) when it starts, so restart it after
+recalibrating. The file is read and written through calibration.py.
 """
 import argparse
-import json
 import time
 from datetime import datetime
 from statistics import mean
 
+import calibration
 import config
 
 # family codes the w1_therm driver handles: DS18B20 (28), DS1822 (22), DS18S20 (10), DS1825 (3b)
 THERM_FAMILIES = ("28", "22", "10", "3b")
 
-CAL_PATH = config.DB_PATH.parent / "sensor2_calibration.json"  # data/ is not in git
 CAL_MIN_SAMPLES = 10
 CAL_SETTLE_C = 0.15  # the error may move this much between the first and second half of a run
 COL_WIDTH = 16       # "31.29 C (+0.04)"
@@ -88,33 +89,6 @@ def no_sensor_help(base, found):
             print("with a 4.7k pull-up from each data wire to 3V3.")
 
 
-def load_calibrations():
-    try:
-        cal = json.loads(CAL_PATH.read_text())
-    except (OSError, ValueError):
-        return {}
-    return cal if isinstance(cal, dict) else {}
-
-
-def load_offset(sensor_id):
-    try:
-        return float(load_calibrations()[sensor_id]["offset_c"])
-    except (KeyError, TypeError, ValueError):
-        return 0.0
-
-
-def save_offset(sensor_id, offset, against, samples):
-    cal = load_calibrations()
-    cal[sensor_id] = {
-        "offset_c": offset,
-        "against": against,
-        "samples": samples,
-        "at": datetime.now().isoformat(timespec="seconds"),
-    }
-    CAL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CAL_PATH.write_text(json.dumps(cal, indent=2) + "\n")
-
-
 def calibrate(targets, ref, seconds, interval, true_temp):
     """Measure how far each target reads from the reference and save the corrections. Returns an exit code."""
     against = f"true temperature {true_temp:.2f} C" if true_temp is not None else f"sensor 1 (main) {ref.name}"
@@ -160,11 +134,12 @@ def calibrate(targets, ref, seconds, interval, true_temp):
             continue
 
         offset = round(-mean(second), 2)
-        save_offset(t.name, offset, against, len(second))
+        calibration.save_offset(t.name, offset, against, len(second))
         print(f"{t.name}: error {mean(second):+.2f} C (spread {max(second) - min(second):.2f} C, "
               f"{len(second)} reads) -> saved offset {offset:+.2f} C")
     if code == 0:
-        print(f"\nSaved to {CAL_PATH}. Check it with: python sensor2_test.py --count 10")
+        print(f"\nSaved to {calibration.CAL_PATH}. Check it with: python sensor2_test.py --count 10")
+        print("Restart squid-dryer.service so the dryer picks the new offsets up.")
     return code
 
 
@@ -221,7 +196,7 @@ def main():
             return 1
         return calibrate(targets, ref, args.calibrate, args.interval, args.true_temp)
 
-    offsets = {t.name: 0.0 if args.raw else load_offset(t.name) for t in targets}
+    offsets = {t.name: 0.0 if args.raw else calibration.load_offset(t.name) for t in targets}
     for name, offset in offsets.items():
         if offset:
             print(f"Calibration applied to {name}: {offset:+.2f} C (--raw shows the uncalibrated reading)")

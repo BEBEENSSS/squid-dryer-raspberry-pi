@@ -28,6 +28,7 @@ from urllib.parse import unquote, urlsplit
 import config
 import machine_settings
 from network_control import parse_network_request
+from snapshot import minute_entries
 
 SESSION_COOKIE = "sd_session"
 SESSION_SECONDS = 12 * 3600
@@ -38,7 +39,7 @@ ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 TASK_COMMANDS = {"start", "add_batch", "complete_batch", "cancel", "resume", "abort", "acknowledge"}
 # the same fields the database rules allow on task/request, plus issued_at which only Firebase needs
 TASK_FIELDS = {"command", "task_id", "command_id", "duration_minutes", "batch_count", "row_levels",
-               "batch_id", "weight_kg", "mode", "requested_by", "issued_at"}
+               "batch_id", "weight_kg", "mode", "requested_by", "issued_at", "bypass_zones"}
 
 mimetypes.add_type("text/javascript", ".js")
 mimetypes.add_type("image/svg+xml", ".svg")
@@ -269,11 +270,7 @@ class LocalApi:
                     task_id = path[len("/api/task-logs/"):]
                     if not ID_RE.match(task_id):
                         return self._json(400, {"error": "invalid_task_id"})
-                    rows = api.store.temp_minutes(task_id)
-                    return self._json(200, {f"{r['minute']:08d}": {
-                        "t": r["minute"] * 60000, "avg": round(r["sum_c"] / r["n"], 2),
-                        "min": round(r["min_c"], 2), "max": round(r["max_c"], 2),
-                        "raw": round(r["raw_last"], 2), "n": r["n"]} for r in rows} or None)
+                    return self._json(200, minute_entries(api.store.temp_minutes(task_id)) or None)
                 if path.startswith("/api/"):
                     return self._json(404, {"error": "not_found"})
                 self._static(path)

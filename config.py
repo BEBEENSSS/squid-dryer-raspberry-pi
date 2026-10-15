@@ -20,6 +20,28 @@ SENSOR_STALE_SECONDS = 10       # no good read for this long -> sensor failed
 TEMP_MAX_C = 60.0               # heater hard cutoff, CHANGE TO YOUR LIMIT
 TEMP_RESUME_DROP = 5.0          # heater can be re-enabled once this far below max
 
+# ---------------- chamber zones: one DS18B20 per 1-Wire bus ----------------
+# bottom = sensor 1 (GPIO4, near the heater and fan), middle = sensor 2 (GPIO22), top = sensor 3 (GPIO23).
+# Sensor 1 alone holds the heater thermostat and the heater interlock, so it can never be bypassed and
+# never gets a calibration offset (it is the reference the others are matched to). The other two widen what
+# counts as "warm" (every zone has to be) and as "hot" (the hottest healthy one decides).
+ZONES = ("bottom", "middle", "top")  # bottom to top
+CONTROL_ZONE = "bottom"
+ZONE_SENSOR_IDS = {
+    "bottom": SENSOR_ID,
+    # Ids as listed by `python sensor2_test.py --expect 3`. The middle/top assignment follows the 1-Wire bus
+    # order (master1 = GPIO22, master2 = GPIO23) and has NOT been confirmed by warming one sensor by hand: if
+    # the dashboard's Middle row reacts when you warm the TOP sensor, swap these two lines and restart.
+    # (A placeholder or malformed id makes every task start be rejected, zones_unconfigured.)
+    "middle": "28-0624c12820aa",
+    "top": "28-0624c1511aba",
+}
+ZONE_ID_PATTERN = r"^28-[0-9a-f]{12}$"
+# Degrees a zone may sit below the shared band floor (target - TARGET_TOLERANCE_C) and still count as warm. The
+# thermostat sits on the bottom sensor, so the upper zones may lag it; raise these from measured runs
+# (the warmup_zone_reached events and the per-zone temperature log show the real gradient).
+ZONE_FLOOR_ALLOWANCE_C = {"middle": 0.0, "top": 0.0}
+
 # ---------------- heater runtime guard (heater_guard.py) ----------------
 # Tune against a measured cold warm-up: the continuous cap must be longer than the longest real
 # uninterrupted heating period, or a slow cold start will trip it.

@@ -1,3 +1,4 @@
+import re
 import threading
 import time
 from pathlib import Path
@@ -71,6 +72,74 @@ class Sensor:
     def temp(self):
         """Last valid temperature if the sensor is healthy, else None."""
         return self.temp_c if self.ok() else None
+
+
+def make_reader(sensor_id, offset_c=0.0, base=None):
+    """Read function for one sensor by id: read_temp plus a calibration offset, None for a bad read."""
+    path = Path(base or config.W1_BASE) / sensor_id
+
+    def read():
+        value = read_temp(path)
+        return None if value is None else round(value + offset_c, 3)
+
+    return read
+
+
+def unconfigured_zones(ids, cfg=config):
+    """Zones whose sensor id is a placeholder, malformed or shared with another zone."""
+    pattern = re.compile(cfg.ZONE_ID_PATTERN)
+    bad = []
+    for zone in cfg.ZONES:
+        sensor_id = ids.get(zone)
+        valid = isinstance(sensor_id, str) and pattern.match(sensor_id)
+        shared = sum(1 for other in cfg.ZONES if ids.get(other) == sensor_id) > 1
+        if not valid or shared:
+            bad.append(zone)
+    return bad
+
+
+class SensorArray:
+    """The chamber sensors by zone. The control sensor (bottom, sensor 1) is the one the thermostat, the
+    heater interlock and restart recovery keep reading alone; the others only widen what counts as warm
+    (warm-up needs every zone) and as hot (the hottest healthy reading decides over-temperature and cooldown).
+    """
+
+    def __init__(self, sensors, ids=None, cfg=config):
+        self.sensors = dict(sensors)          # zone -> Sensor
+        self.zones = tuple(z for z in cfg.ZONES if z in self.sensors)
+        self.control = self.sensors[cfg.CONTROL_ZONE]
+        self.control_zone = cfg.CONTROL_ZONE
+        self._ids = None if ids is None else dict(ids)  # None: ids are not applicable (simulation, tests)
+        self._cfg = cfg
+
+    @property
+    def others(self):
+        """Zones other than the control one, bottom to top."""
+        return tuple(z for z in self.zones if z != self.control_zone)
+
+    def healthy(self, zone):
+        return self.sensors[zone].ok()
+
+    def temp(self, zone):
+        return self.sensors[zone].temp()
+
+    def temps(self):
+        """Healthy reading per zone, None for a zone that is not healthy."""
+        return {zone: self.sensors[zone].temp() for zone in self.zones}
+
+    def unconfigured(self):
+        return [] if self._ids is None else unconfigured_zones(self._ids, self._cfg)
+
+    def configured(self):
+        return not self.unconfigured()
+
+    def hottest(self):
+        """Hottest healthy reading. None while the control sensor is unhealthy: nothing may rely on a
+        chamber reading the heater's own sensor cannot confirm."""
+        if self.control.temp() is None:
+            return None
+        temps = [t for t in (s.temp() for s in self.sensors.values()) if t is not None]
+        return max(temps) if temps else None
 
 
 class SafeHeater:
