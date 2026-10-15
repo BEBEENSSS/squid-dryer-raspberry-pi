@@ -13,6 +13,9 @@ The Pi is the authority on what the machine is actually doing. Firebase is used 
 | `recovery.py` | Decision after a restart: resume / failed / recovery required |
 | `task_store.py` | SQLite record (`data/dryer.db`): tasks, temperature log, event outbox, processed commands |
 | `cloud_sync.py` | Background Firebase thread: command stream + polling, heartbeat, event upload |
+| `temp_sync.py` | Temperature history: a recorder thread (SQLite) and an uploader thread (Firebase), both off the control loop |
+| `temp_history.py` | Pure rules for that history: record ids, payloads, retry backoff, which old records may be trimmed |
+| `link_monitor.py` | Tells `offline`, `firebase_unavailable` and `synced` apart from real request results (plus a small internet probe) |
 | `hardware.py` | Relays, sensor reading, and `SensorArray` (the three chamber sensors by zone) |
 | `local_api.py` | Local HTTP API and the web panel, so the machine works from a phone with no internet |
 | `netwatch.py`, `net_policy.py` | Own service: home Wi-Fi first, hotspot as fallback (`net_policy.py` is the pure decision logic) |
@@ -109,10 +112,18 @@ The rules are checked in this order:
 | `WARMUP_TIMEOUT_SECONDS` | 10800 | target not confirmed by then → `warmup_timeout`, heater off |
 | `DIP_WARNING_LIMIT_SECONDS` | 600 | a dip below the band this long during drying sets `dip_warning` |
 | `MAX_TEMP_CUTOFF_C` | 60 | software over-temperature fault: `min(target + 10, TEMP_MAX_C)` |
-| `ZONE_SENSOR_IDS` | sensor 1's id + two placeholders | 1-Wire id of the bottom, middle and top sensor. **While the middle or top id is a placeholder every start is rejected (`zones_unconfigured`)** |
+| `ZONE_SENSOR_IDS` | the three sensors' ids | 1-Wire id of the bottom, middle and top sensor. **A placeholder, malformed or duplicated id rejects every start (`zones_unconfigured`)**. The middle/top order in the repo follows the bus order and still needs confirming by warming one sensor by hand |
 | `ZONE_FLOOR_ALLOWANCE_C` | middle 0, top 0 | extra degrees a zone may sit below the shared band floor and still count as warm. Frozen per task when it starts |
 | `TEMP_PLAUSIBLE_MIN_C` / `MAX_C` | −10 / 100 | readings outside this count as failed reads |
 | `TEMP_LOG_UPLOAD_SECONDS`, `TEMP_LOG_BATCH` | 60, 500 | per-minute temperature summaries to Firebase |
+| `TEMP_HISTORY_INTERVAL_SECONDS` | 30 | one reading per sensor is recorded this often (see "Temperature history and offline buffering") |
+| `TEMP_HISTORY_RETENTION` | 5760 | newest records kept in Firebase (48 h at 30 s). Older ones are deleted only when newer ones are uploaded |
+| `TEMP_HISTORY_BATCH`, `TEMP_HISTORY_TRIM_CHUNK` | 100, 500 | records per upload request, and old records deleted per request |
+| `TEMP_LOCAL_KEEP` | 5760 | delivered records kept in `data/dryer.db` so the local panel has a history |
+| `TEMP_BUFFER_MAX` | 100000 | unsent records kept (about 35 days at 30 s). Past it the oldest are dropped and a `temp_buffer_overflow` event is logged |
+| `TEMP_SYNC_BACKOFF_BASE` / `_MAX`, `TEMP_SYNC_IDLE_SECONDS` | 5 / 120, 10 | retry delay after a failed upload (doubling, with jitter), and how often an idle uploader looks again |
+| `INTERNET_PROBE_TARGETS`, `INTERNET_PROBE_TIMEOUT` | three IP:port pairs, 3 | what counts as "the internet is reachable" (TCP connects, no DNS), and the limit per target |
+| `INTERNET_PROBE_BACKOFF_BASE` / `_MAX` | 10 / 120 | spacing of probes while something keeps failing |
 | `COOLDOWN_SAFE_TEMP_C` | 40 | default cooldown temperature; the web app can change it (`settings/safe_temp_c`, 25–50) |
 | `COOLDOWN_MAX_SECONDS` | 3600 | cooling is cut off after this long |
 | `COOLDOWN_NO_SENSOR_SECONDS` | 600 | fan run time if the sensor is dead while cooling |
@@ -201,6 +212,8 @@ The schema follows the web app. Security rules are in `database.rules.json`. The
   - `reason` is set for failures and recovery holds, e.g. `possible_power_loss`, `warmup_timeout`, `invalid_session`, `zone_sensor_failure` (a middle or top sensor stopped reading during warm-up). Start rejections added with the zones: `zones_unconfigured`, `zone_sensor_unavailable`, `invalid_bypass_zones`.
   - `detail` is a short readable summary. The full diagnostics are in `events`.
   - `seq` increases with every change.
+- `temp_history/{key}`: `{t, bottom, middle, top}`, the rolling temperature record behind the dashboard chart. `key` is the collection time in ms, zero-padded to 13 digits, so keys sort by time and are also the record id. `t` is the same time as a number. A sensor with no valid reading is absent from the record. Unlike `task_logs` it is written whether or not a task runs, and it is bounded: see "Temperature history and offline buffering".
+- `state/temp_pending`: how many recorded readings Firebase has not confirmed yet (0 when caught up).
 - `state/status`: `ready`, `starting`, `warming_up`, `running`, `cooling`, `recovering`, `recovery_required` or `failed` (a failure not yet acknowledged). `state/ready` is true when a new task can be started.
 - `state/fan`, `heater`, `temp`, `sensor_ok`, `temp_max`, `last_event`, `boot_id`, `pending_events` (events still waiting to upload). `temp` and `sensor_ok` are the **bottom** sensor (sensor 1), as they always were.
 - `state/temp_middle`, `temp_top` (removed while that sensor is unhealthy), `sensor_middle_ok`, `sensor_top_ok`, and `zones_configured` (false while a sensor id in `config.py` is still a placeholder; every start is then rejected and `ready` is false).
@@ -217,6 +230,33 @@ The schema follows the web app. Security rules are in `database.rules.json`. The
 - If only `connection_lost` / `connection_restored` events appear, it was just an internet outage.
 
 To notify the user about a technical failure, watch `task/report`. `status == "failed"` (`reason` says why, e.g. `possible_power_loss` or `sensor_failure`) needs an `acknowledge`; `recovery_required` needs a `resume` or `abort`.
+
+## Temperature history and offline buffering
+
+The dashboard's Temperature Monitoring chart reads `temp_history`. It is separate from `task_logs`, which stays the per-task audit trail (per-minute summaries, written only while a task runs).
+
+**Recording** (`TempRecorder`, its own thread). Every `TEMP_HISTORY_INTERVAL_SECONDS` it takes the latest healthy reading of each of the three sensors (sensor 1 bottom / GPIO4, sensor 2 middle / GPIO22, sensor 3 top / GPIO23) and inserts one row into the `temp_history` table of `data/dryer.db` (WAL, `synchronous=FULL`, so rows survive a crash, a service restart and a reboot). A stale or failed sensor is left out of the row, never stored as `0`. If none has a reading, no row is written and the chart shows a gap. Recording never touches the network and runs whether or not a task is active.
+
+**Uploading** (`TempUploader`, its own thread, separate from the command thread so a backlog cannot delay a command). It sends pending rows oldest first, up to `TEMP_HISTORY_BATCH` per request, as one atomic multi-path `update()`. A row is marked delivered **only after that call returns**. On any error the rows stay pending, and the retry waits `5, 10, 20 ... 120 s` (with jitter). New readings do not shorten that wait, but the main heartbeat getting through again does. Each request is bounded by the Admin SDK's `httpTimeout` (10 s).
+
+**No duplicates.** The record id is the Firebase key, derived once from the collection time and stored with the row. A retry (including after a reply that was lost although Firebase had stored the data) writes the same path with the same value, so it cannot create a second record. Delivered rows are deleted locally only past `TEMP_LOCAL_KEEP` (they stay so the local panel has a history); unsent rows are never pruned, except by the `TEMP_BUFFER_MAX` safety cap, which logs `temp_buffer_overflow`.
+
+**Retention.** Firebase keeps at most `TEMP_HISTORY_RETENTION` records. The uploader remembers which keys exist (one shallow read after start-up, and again after any request whose outcome it could not see), and the request that stores new records also deletes exactly the oldest ones needed to get back to the limit. Two rules: nothing is deleted unless a new record is being stored, so an idle machine never loses history because time passed; and nothing at or after the oldest record still waiting to be sent is ever deleted. If the shallow read fails, uploads carry on and trimming waits.
+
+**The clock.** The Pi has no RTC. A reading taken while `clock_synced` is false has no time yet; it is dated afterwards from its monotonic timestamp, once the clock syncs in the same boot, and only then offered for upload. Readings of a boot whose clock never synced are kept locally but never sent with a guessed time.
+
+**Connectivity.** `link_monitor.py` classifies the link from the outcome of real requests (the heartbeat and the uploads), not from the Wi-Fi interface:
+
+| status | meaning |
+|---|---|
+| `synced` | Firebase answered the latest request on every channel |
+| `firebase_unavailable` | a request failed or timed out, but a TCP connection to a public IP (`INTERNET_PROBE_TARGETS`) opens. `link.dns` says whether the Firebase host name resolves |
+| `offline` | a request failed and no probe target answers |
+| `unknown` | nothing tried yet, or a failure not probed yet |
+
+Probing only happens while something is failing, with backoff, and never on the control loop. The status is in `/api/snapshot` as `link` (local panel only: a machine that cannot reach Firebase cannot tell the cloud so). The cloud sees `state/temp_pending` instead, and the dashboard infers an outage from `last_seen` going stale.
+
+Look at the buffer on the Pi with `sqlite3 data/dryer.db "SELECT COUNT(*) FROM temp_history WHERE synced=0"`.
 
 ## Local mode and networking
 

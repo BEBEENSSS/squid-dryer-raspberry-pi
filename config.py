@@ -129,6 +129,28 @@ TEMP_PUBLISH_SECONDS = 5        # how often temp is sent to Firebase
 SYNC_BACKOFF_MAX = 30           # retry delay cap while offline
 EVENT_BATCH = 50                # events uploaded per write
 
+# ---------------- temperature history (temp_sync.py) ----------------
+# A rolling chart history, separate from the per-task audit log: the Pi records one reading per sensor every
+# interval whether or not a task runs, keeps unsent ones in SQLite, and uploads them under
+# temp_history/{collection time in ms}. The key is the record id, so a retry overwrites instead of duplicating.
+TEMP_HISTORY_INTERVAL_SECONDS = 30
+TEMP_HISTORY_RETENTION = 5760   # newest records kept in Firebase (48 h at 30 s); trimmed only when new ones arrive
+TEMP_HISTORY_BATCH = 100        # records per upload request
+TEMP_HISTORY_TRIM_CHUNK = 500   # most old records deleted in one request
+TEMP_LOCAL_KEEP = 5760          # uploaded records kept locally so the local panel has a history
+TEMP_BUFFER_MAX = 100_000       # unsent records kept (about 35 days); beyond it the oldest go, with an event
+TEMP_SYNC_IDLE_SECONDS = 10     # how often an idle uploader looks for work it was not told about
+TEMP_SYNC_BACKOFF_BASE = 5      # seconds before the first retry after a failed upload, doubling ...
+TEMP_SYNC_BACKOFF_MAX = 120     # ... up to this
+
+# ---------------- connectivity classification (link_monitor.py) ----------------
+# Reaching one of these over TCP proves the Pi has internet, whatever Firebase is doing. They are IP literals
+# on purpose: a DNS outage must not look like "no internet".
+INTERNET_PROBE_TARGETS = (("1.1.1.1", 443), ("8.8.8.8", 53), ("9.9.9.9", 443))
+INTERNET_PROBE_TIMEOUT = 3      # seconds per target
+INTERNET_PROBE_BACKOFF_BASE = 10  # seconds between probes while Firebase keeps failing, doubling ...
+INTERNET_PROBE_BACKOFF_MAX = 120  # ... up to this
+
 LOOP_INTERVAL = 0.5             # control loop tick
 
 # ---------------- network fallback (netwatch.py) ----------------

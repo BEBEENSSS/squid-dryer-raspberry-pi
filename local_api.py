@@ -23,10 +23,11 @@ from collections import defaultdict, deque
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import config
 import machine_settings
+import temp_history
 from network_control import parse_network_request
 from snapshot import minute_entries
 
@@ -266,6 +267,14 @@ class LocalApi:
                     return self._json(200, snap) if snap else self._json(503, {"error": "starting"})
                 if path == "/api/session":
                     return self._json(200, {"authenticated": self._authed(), "pin_set": api.auth.pin_set()})
+                if path == "/api/temp-history":
+                    # the same shape as Firebase temp_history, so the web app parses both alike
+                    try:
+                        since = int(parse_qs(urlsplit(self.path).query).get("since", ["0"])[0])
+                    except ValueError:
+                        return self._json(400, {"error": "invalid_since"})
+                    rows = api.store.temp_history_since(max(0, since))
+                    return self._json(200, {r["rid"]: temp_history.payload(r) for r in rows} or None)
                 if path.startswith("/api/task-logs/"):
                     task_id = path[len("/api/task-logs/"):]
                     if not ID_RE.match(task_id):

@@ -73,6 +73,8 @@ class FakeBase:
         self.fail = False
         self.updates = 0
         self.server_ms = None  # when set, server timestamps resolve to it like the real database
+        self.ack_lost = False  # the next update is stored, then raises: the reply never arrived
+        self.fail_updates = 0  # how many of the next updates fail before storing anything (a flaky link)
 
     def _check(self):
         if self.fail:
@@ -82,11 +84,13 @@ class FakeBase:
         base = self
 
         class Ref:
-            def get(self_):
+            def get(self_, shallow=False):
                 base._check()
                 node = base.data
                 for part in path.split("/"):
                     node = node.get(part) if isinstance(node, dict) else None
+                if shallow and isinstance(node, dict):
+                    return {key: True for key in node}  # keys only, like a shallow read
                 return node
 
         return Ref()
@@ -94,6 +98,15 @@ class FakeBase:
     def update(self, values):
         self._check()
         self.updates += 1
+        if self.fail_updates > 0:
+            self.fail_updates -= 1
+            raise TimeoutError("update timed out")
+        self._apply(values)
+        if self.ack_lost:
+            self.ack_lost = False
+            raise TimeoutError("reply lost after the update was stored")
+
+    def _apply(self, values):
         for path, value in values.items():
             parts = path.split("/")
             node = self.data

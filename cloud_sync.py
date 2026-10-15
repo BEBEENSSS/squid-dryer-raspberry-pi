@@ -28,7 +28,7 @@ def firebase_base():
 class CloudSync:
     def __init__(self, store_factory, tm, status_fn, commands, boot_id,
                  base_factory=firebase_base, mono=time.monotonic, cfg=config, local_mark=None,
-                 network_ack_fn=None):
+                 network_ack_fn=None, link=None):
         self.store_factory = store_factory  # store is opened inside the sync thread
         self.tm = tm
         self.status_fn = status_fn          # dict of live machine state (fan, heater, temp, ...)
@@ -39,6 +39,7 @@ class CloudSync:
         self.cfg = cfg
         self.local_mark = local_mark        # when the local panel was last used (command_age.py)
         self.network_ack_fn = network_ack_fn  # newest answer to a network/request, or None
+        self.link = link                    # link_monitor.LinkMonitor, told how each round trip went
         self._last_network_id = None
 
         self._base = None
@@ -105,7 +106,11 @@ class CloudSync:
             self._publish()
         except Exception as e:
             self._went_offline(e)
+            if self.link is not None:
+                self.link.firebase_failed("state", e)
             return False
+        if self.link is not None:
+            self.link.firebase_ok("state")  # the polls above are real round trips, even when nothing was due to write
         return True
 
     # ---------------- internals ----------------
@@ -210,8 +215,8 @@ class CloudSync:
         # cleared before the status is read, so a change made during the write publishes again
         dirty, self._state_dirty = self._state_dirty, False
         status = self.status_fn()
-        # the temperatures keep their own cadence
-        sig = {k: v for k, v in status.items() if k not in ("temp", "temp_middle", "temp_top")}
+        # the temperatures keep their own cadence, and so does the count of readings waiting to upload
+        sig = {k: v for k, v in status.items() if k not in ("temp", "temp_middle", "temp_top", "temp_pending")}
 
         due = (
             writes or events or dirty or sig != self._last_sig

@@ -14,15 +14,17 @@ if SIMULATE:
 import calibration  # noqa: E402
 import config  # noqa: E402
 import sd_notify  # noqa: E402
-from cloud_sync import CloudSync  # noqa: E402
+from cloud_sync import CloudSync, firebase_base  # noqa: E402
 from command_age import LocalCommandMark  # noqa: E402
 from hardware import Outputs, Sensor, SensorArray, make_reader  # noqa: E402
+from link_monitor import LinkMonitor  # noqa: E402
 from local_api import LocalApi  # noqa: E402
 from netinfo import lan_ip, read_network_status  # noqa: E402
 from network_control import NetworkControl, network_ack_payload  # noqa: E402
 from snapshot import build_snapshot, zone_state  # noqa: E402
 from task_manager import TaskManager  # noqa: E402
 from task_store import TaskStore  # noqa: E402
+from temp_sync import Gauge, TempRecorder, TempUploader  # noqa: E402
 
 TIMESYNC_FLAG = Path("/run/systemd/timesync/synchronized")
 
@@ -235,6 +237,9 @@ def main():
 
     commands = queue.Queue()
     sync = None
+    # readings recorded but not yet confirmed by Firebase; a number, so the control loop never queries for it
+    temp_pending = Gauge(store.temp_history_pending_count())
+    link = LinkMonitor()
 
     def on_task_start():
         # a stale manual command must not take over when the task ends
@@ -290,6 +295,7 @@ def main():
             "command_source": manual.last_command_source,
             "command_at": manual.last_command_at,
             "clock_synced": bool(clock_synced()),
+            "temp_pending": temp_pending.value,
             "local_url": f"http://{ip}:{config.LOCAL_API_PORT}" if (ip := lan_ip()) else None,
             # which network the machine is on and why; only the Wi-Fi side of this ever reaches Firebase
             "network": net.get("network"),
@@ -303,7 +309,12 @@ def main():
     tm.local_mark = local_mark
     netctl = NetworkControl(now_ms=lambda: now_ms())  # now_ms is defined below, before it is first called
     sync = CloudSync(open_store, tm, status, commands, boot_id, local_mark=local_mark,
-                     network_ack_fn=lambda: network_ack_payload(netctl.last_ack))
+                     network_ack_fn=lambda: network_ack_payload(netctl.last_ack), link=link)
+    # The temperature history has its own threads and its own Firebase round trips: a backlog, a timeout or a
+    # trim must never delay a command or the control loop.
+    uploader = TempUploader(open_store, firebase_base, link, temp_pending)
+    link.on_recovered(uploader.recovered)
+    recorder = TempRecorder(open_store, zones, clock_synced, temp_pending, wake=uploader.wake)
     snapshot = {"value": None}   # swapped whole by the control loop, read by the HTTP thread
     task_request = {"value": None}  # newest task request seen from either panel
     last_tick = {"at": time.monotonic()}
@@ -318,7 +329,7 @@ def main():
             state=status(), manual=dict(manual.wanted), settings=tm.settings, request=task_request["value"],
             report=tm.snapshot(), ack=store.last_command(), pi_now_ms=now_ms(),
             cloud_online=sync.online, loop_age_s=time.monotonic() - last_tick["at"],
-            wifi=network_status(), network_ack=network_ack_payload(netctl.last_ack))
+            wifi=network_status(), network_ack=network_ack_payload(netctl.last_ack), link=link.snapshot())
     manual = ManualControl(out, sensor, store, sync, tm)
     tm.server_now_ms = sync.server_clock.now_ms  # command age is judged on server time, not the Pi clock
 
@@ -342,6 +353,8 @@ def main():
     for zone, s in zones.sensors.items():
         threading.Thread(target=read_sensor, args=(s,), daemon=True, name=f"sensor-{zone}").start()
     threading.Thread(target=sync.run, args=(stop,), daemon=True, name="cloud-sync").start()
+    threading.Thread(target=recorder.run, args=(stop,), daemon=True, name="temp-recorder").start()
+    threading.Thread(target=uploader.run, args=(stop,), daemon=True, name="temp-uploader").start()
     api = LocalApi(get_snapshot=lambda: snapshot["value"] and dict(
         snapshot["value"], loop_age_s=round(time.monotonic() - last_tick["at"], 2)),
         commands=commands, store=store, local_mark=local_mark)

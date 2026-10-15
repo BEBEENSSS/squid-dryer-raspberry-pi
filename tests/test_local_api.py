@@ -17,6 +17,14 @@ class FakeStore:
             return []
         return [{"minute": 10, "n": 2, "sum_c": 100.0, "min_c": 49.0, "max_c": 51.0, "raw_last": 50.5}]
 
+    ROWS = [
+        {"rid": "1800000000000", "t_ms": 1_800_000_000_000, "bottom": 30.1, "middle": 29.0, "top": 28.0},
+        {"rid": "1800000030000", "t_ms": 1_800_000_030_000, "bottom": 30.4, "middle": None, "top": 28.2},
+    ]
+
+    def temp_history_since(self, since_ms):
+        return [r for r in self.ROWS if r["t_ms"] >= since_ms]
+
 
 @pytest.fixture
 def web(tmp_path):
@@ -148,6 +156,23 @@ def test_task_logs_use_the_firebase_shape(api):
     resp, raw = call(api, "GET", "/api/task-logs/T1")
     assert json.loads(raw) == {"00000010": {"t": 600000, "avg": 50.0, "min": 49.0, "max": 51.0, "raw": 50.5, "n": 2}}
     assert call(api, "GET", "/api/task-logs/..%2Fetc")[0].status == 400
+
+
+def test_temp_history_uses_the_firebase_shape_and_leaves_out_a_dead_sensor(api):
+    resp, raw = call(api, "GET", "/api/temp-history")
+    assert resp.status == 200 and resp.getheader("Cache-Control") == "no-store"
+    assert json.loads(raw) == {
+        "1800000000000": {"t": 1_800_000_000_000, "bottom": 30.1, "middle": 29.0, "top": 28.0},
+        "1800000030000": {"t": 1_800_000_030_000, "bottom": 30.4, "top": 28.2},  # no "middle": null
+    }
+
+
+def test_temp_history_since_returns_only_newer_records_and_null_when_there_are_none(api):
+    _, raw = call(api, "GET", "/api/temp-history?since=1800000030000")
+    assert list(json.loads(raw)) == ["1800000030000"]
+    _, raw = call(api, "GET", "/api/temp-history?since=1900000000000")
+    assert json.loads(raw) is None
+    assert call(api, "GET", "/api/temp-history?since=abc")[0].status == 400
 
 
 def test_static_files_spa_fallback_and_cache_headers(api):

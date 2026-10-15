@@ -6,6 +6,8 @@ import threading
 import time
 from pathlib import Path
 
+from temp_history import SENSORS, placed_ms, record_key
+
 # statuses that mean a task still owns the machine
 ACTIVE_STATUSES = ("starting", "warming_up", "running", "recovering", "recovery_required")
 
@@ -109,6 +111,21 @@ CREATE TABLE IF NOT EXISTS task_excursions (
     min_c REAL NOT NULL,
     PRIMARY KEY (task_id, start_wall)
 );
+CREATE TABLE IF NOT EXISTS temp_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rid TEXT UNIQUE,          -- record id and Firebase key (see temp_history.record_key); NULL until the time is trusted
+    boot_id TEXT NOT NULL,
+    mono REAL NOT NULL,
+    wall REAL NOT NULL,
+    clock_synced INTEGER NOT NULL,
+    t_ms INTEGER,             -- collection time; NULL while taken with an unsynced clock
+    bottom REAL,
+    middle REAL,
+    top REAL,
+    synced INTEGER NOT NULL DEFAULT 0   -- 1 once Firebase has confirmed the record
+);
+CREATE INDEX IF NOT EXISTS temp_history_pending ON temp_history (t_ms) WHERE synced=0;
+CREATE INDEX IF NOT EXISTS temp_history_time ON temp_history (t_ms);
 """
 
 
@@ -376,6 +393,85 @@ class TaskStore:
         with self._conn() as c:
             c.executemany(
                 "UPDATE temp_minutes SET uploaded=1 WHERE task_id=? AND minute=? AND n=? AND zone=?", items)
+
+    # ---------------- temperature history (rolling chart data, see temp_sync.py) ----------------
+    @staticmethod
+    def _free_t(c, t_ms):
+        """The first time at or after `t_ms` whose record id is unused, so two readings never share a key."""
+        while c.execute("SELECT 1 FROM temp_history WHERE rid=?", (record_key(t_ms),)).fetchone():
+            t_ms += 1
+        return t_ms
+
+    def add_temp_reading(self, readings, mono):
+        """Store one reading per sensor ({zone: °C}, only zones that have one). Returns the row id.
+
+        With a synced clock the record gets its time and id at once. Otherwise it waits, with its monotonic
+        time, for place_temp_history: a wall clock that is not synced would date it wrongly.
+        """
+        wall, synced = self._wall(), bool(self._clock_synced())
+        with self._conn() as c:
+            t_ms = self._free_t(c, int(round(wall * 1000))) if synced else None
+            cur = c.execute(
+                "INSERT INTO temp_history(rid, boot_id, mono, wall, clock_synced, t_ms, bottom, middle, top) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (record_key(t_ms) if synced else None, self.boot_id, mono, wall, int(synced), t_ms,
+                 *(readings.get(zone) for zone in SENSORS)))
+            return cur.lastrowid
+
+    def place_temp_history(self, mono_now):
+        """Date this boot's readings that were taken before the clock synced. Call once it has.
+
+        Readings of an earlier boot are left alone: how its monotonic clock related to the wall clock is gone,
+        so any time given to them would be a guess.
+        """
+        wall_now = self._wall()
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT id, mono FROM temp_history WHERE boot_id=? AND t_ms IS NULL AND mono<=? ORDER BY mono",
+                (self.boot_id, mono_now)).fetchall()
+            for r in rows:
+                t_ms = self._free_t(c, placed_ms(r["mono"], wall_now, mono_now))
+                c.execute("UPDATE temp_history SET t_ms=?, rid=? WHERE id=?", (t_ms, record_key(t_ms), r["id"]))
+        return len(rows)
+
+    def pending_temp_history(self, limit=100):
+        """Readings Firebase has not confirmed, oldest first. Ones without a trusted time are not offered."""
+        return [dict(r) for r in self._conn().execute(
+            "SELECT * FROM temp_history WHERE synced=0 AND t_ms IS NOT NULL ORDER BY t_ms, id LIMIT ?", (limit,))]
+
+    def temp_history_pending_count(self):
+        """Readings still to deliver: dated ones, and this boot's that are only waiting for the clock."""
+        return self._conn().execute(
+            "SELECT COUNT(*) FROM temp_history WHERE synced=0 AND (t_ms IS NOT NULL OR boot_id=?)",
+            (self.boot_id,)).fetchone()[0]
+
+    def mark_temp_history_synced(self, ids):
+        """Only for rows whose upload Firebase has acknowledged."""
+        if not ids:
+            return
+        with self._conn() as c:
+            c.executemany("UPDATE temp_history SET synced=1 WHERE id=?", [(i,) for i in ids])
+
+    def temp_history_since(self, since_ms, limit=100_000):
+        """Dated readings from `since_ms` on, oldest first, delivered or not (the local panel shows both)."""
+        return [dict(r) for r in self._conn().execute(
+            "SELECT rid, t_ms, bottom, middle, top FROM temp_history WHERE t_ms IS NOT NULL AND t_ms>=? "
+            "ORDER BY t_ms LIMIT ?", (since_ms, limit))]
+
+    def prune_temp_history(self, keep, buffer_max):
+        """Drop delivered readings beyond the newest `keep`. Undelivered ones go only past `buffer_max`, the cap
+        that stops a months-long outage from filling the disk; returns how many of those were dropped."""
+        with self._conn() as c:
+            c.execute(
+                "DELETE FROM temp_history WHERE synced=1 AND t_ms <= "
+                "(SELECT t_ms FROM temp_history WHERE synced=1 ORDER BY t_ms DESC LIMIT 1 OFFSET ?)", (keep,))
+            over = c.execute("SELECT COUNT(*) FROM temp_history WHERE synced=0").fetchone()[0] - buffer_max
+            if over <= 0:
+                return 0
+            c.execute(
+                "DELETE FROM temp_history WHERE id IN "
+                "(SELECT id FROM temp_history WHERE synced=0 ORDER BY COALESCE(t_ms, 0), id LIMIT ?)", (over,))
+            return over
 
     # ---------------- temperature excursions ----------------
     def save_excursion(self, task_id, start_wall, end_wall, min_c):
