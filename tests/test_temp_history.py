@@ -1,6 +1,8 @@
 import math
 
-from temp_history import RemoteWindow, backoff_delay, clean_readings, payload, placed_ms, record_key
+import pytest
+
+from temp_history import RemoteWindow, backoff_delay, clean_readings, payload, placed_ms, record_key, worth_recording
 
 
 def test_keys_are_fixed_width_so_they_sort_by_time():
@@ -23,6 +25,40 @@ def test_payload_carries_the_time_and_only_the_sensors_that_read():
     row = {"t_ms": 1_800_000_000_123, "bottom": 31.456, "middle": None, "top": 28.0}
     assert payload(row) == {"t": 1_800_000_000_123, "bottom": 31.46, "top": 28.0}
     assert payload({"t_ms": 7, "bottom": None, "middle": None, "top": None}) == {"t": 7}
+
+
+def test_payload_marks_a_record_that_does_not_continue_the_one_before_only_when_it_does_not():
+    row = {"t_ms": 7, "bottom": 30.0, "middle": None, "top": None}
+    assert payload(dict(row, gap=1)) == {"t": 7, "bottom": 30.0, "gap": True}
+    assert payload(dict(row, gap=0)) == {"t": 7, "bottom": 30.0}
+    assert payload(row) == {"t": 7, "bottom": 30.0}  # a row from before the flag existed
+
+
+LAST = {"bottom": 30.0, "middle": 29.0, "top": 28.0}
+
+
+@pytest.mark.parametrize("zone", ["bottom", "middle", "top"])
+@pytest.mark.parametrize("delta,expected", [(0.0, False), (0.99, False), (-0.99, False), (1.0, True), (-1.0, True),
+                                            (2.5, True), (-4.0, True)])
+def test_every_sensor_is_held_to_the_same_limit(zone, delta, expected):
+    assert worth_recording(LAST, {**LAST, zone: LAST[zone] + delta}, 1.0) is expected
+
+
+def test_a_change_is_judged_against_the_record_not_against_the_previous_sample():
+    assert worth_recording(LAST, {**LAST, "bottom": 30.6}, 1.0) is False
+    assert worth_recording(LAST, {**LAST, "bottom": 31.2}, 1.0) is True  # 1.2 from the record, 0.6 from the sample before
+
+
+def test_a_sensor_starting_or_stopping_and_a_missing_baseline_are_always_worth_recording():
+    assert worth_recording(LAST, {"bottom": 30.0, "top": 28.0}, 1.0) is True   # the middle stopped reading
+    assert worth_recording({"bottom": 30.0}, LAST, 1.0) is True                # the others started
+    assert worth_recording(LAST, dict(LAST), 1.0) is False
+    assert worth_recording(None, dict(LAST), 1.0) is True
+
+
+def test_a_limit_of_zero_records_every_sample_and_float_noise_does_not_hide_an_exact_degree():
+    assert worth_recording(LAST, dict(LAST), 0.0) is True
+    assert worth_recording({"bottom": 30.06}, {"bottom": 31.06}, 1.0) is True  # 31.06 - 30.06 is 0.9999999999999964
 
 
 def test_a_reading_from_before_the_clock_synced_is_dated_by_how_long_ago_it_was():

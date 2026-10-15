@@ -1,6 +1,8 @@
-"""Rolling temperature history: record every sensor on a timer, keep what Firebase has not confirmed, send it later.
+"""Rolling temperature history: sample every sensor on a timer, record a sample only when it changed, keep what
+Firebase has not confirmed, send it later.
 
-    TempRecorder   its own thread. Reads the three sensors, writes a row to SQLite. Never touches the network.
+    TempRecorder   its own thread. Reads the three sensors, writes a row to SQLite when one moved. Never touches
+                   the network.
     TempUploader   its own thread. Sends pending rows to Firebase oldest first and marks one delivered only
                    after Firebase has answered. Failures leave the rows where they are and back off.
 
@@ -13,7 +15,7 @@ import threading
 import time
 
 import config
-from temp_history import RemoteWindow, backoff_delay, clean_readings, payload
+from temp_history import RemoteWindow, backoff_delay, clean_readings, payload, worth_recording
 
 START_DELAY_SECONDS = 3  # lets the sensor threads take their first reading before the first record
 
@@ -36,6 +38,9 @@ class TempRecorder:
         self.wake = wake                # called after a new row, so the uploader sends it at once
         self._store = None
         self._unplaced = True           # rows may be waiting for a trusted clock (also from before a restart)
+        # The readings of the newest record, what the next sample is compared with. None: there is nothing to
+        # continue, which is true at start-up and after every sensor failed, and the next record is flagged `gap`.
+        self._last = None
 
     def store(self):
         if self._store is None:
@@ -43,18 +48,23 @@ class TempRecorder:
         return self._store
 
     def sample_once(self):
-        """Record one reading per sensor that has one. Returns the row id, or None when no sensor has a fresh,
-        valid reading: that leaves a gap in the history instead of a value nobody measured."""
+        """Record the sample if it changed. Returns the row id, or None when nothing was recorded: no sensor has
+        a fresh, valid reading (that leaves a gap in the history instead of a value nobody measured), or no
+        sensor moved by `TEMP_HISTORY_MIN_CHANGE_C` since the previous record."""
         store = self.store()
         if self._unplaced and self.clock_synced():
             store.place_temp_history(self.mono())
             self._unplaced = False
         readings = clean_readings(self.zones.temps())  # None for a stale or failed sensor, so it is left out
         if not readings:
+            self._last = None  # whatever is measured next does not continue what came before
+            return None
+        if not worth_recording(self._last, readings, self.cfg.TEMP_HISTORY_MIN_CHANGE_C):
             return None
         if not self.clock_synced():
             self._unplaced = True
-        row_id = store.add_temp_reading(readings, self.mono())
+        row_id = store.add_temp_reading(readings, self.mono(), gap=self._last is None)
+        self._last = readings
         dropped = store.prune_temp_history(self.cfg.TEMP_LOCAL_KEEP, self.cfg.TEMP_BUFFER_MAX)
         if dropped:
             # the only place an undelivered reading is ever given up, and it says so

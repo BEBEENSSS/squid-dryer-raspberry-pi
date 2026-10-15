@@ -136,15 +136,21 @@ SYNC_BACKOFF_MAX = 30           # retry delay cap while offline
 EVENT_BATCH = 50                # events uploaded per write
 
 # ---------------- temperature history (temp_sync.py) ----------------
-# A rolling chart history, separate from the per-task audit log: the Pi records one reading per sensor every
-# interval whether or not a task runs, keeps unsent ones in SQLite, and uploads them under
-# temp_history/{collection time in ms}. The key is the record id, so a retry overwrites instead of duplicating.
-TEMP_HISTORY_INTERVAL_SECONDS = 30
-TEMP_HISTORY_RETENTION = 5760   # newest records kept in Firebase (48 h at 30 s); trimmed only when new ones arrive
+# A rolling chart history, separate from the per-task audit log: the Pi samples every sensor on an interval
+# whether or not a task runs, but only records a sample when it differs from the previous record (below). It
+# keeps unsent records in SQLite and uploads them under temp_history/{collection time in ms}. The key is the
+# record id, so a retry overwrites instead of duplicating.
+TEMP_HISTORY_INTERVAL_SECONDS = 30  # how often the sensors are sampled, not how often a record is written
+# A sample is recorded only if some sensor moved at least this far from its own value in the previous record
+# (or a sensor started or stopped reading). The same limit applies to bottom, middle and top. 0 records every sample.
+TEMP_HISTORY_MIN_CHANGE_C = 1.0
+# Newest records kept in Firebase, trimmed only when new ones arrive. Records are written only on change, so this
+# spans far more than 48 h unless the chamber is changing all the time.
+TEMP_HISTORY_RETENTION = 5760
 TEMP_HISTORY_BATCH = 100        # records per upload request
 TEMP_HISTORY_TRIM_CHUNK = 500   # most old records deleted in one request
 TEMP_LOCAL_KEEP = 5760          # uploaded records kept locally so the local panel has a history
-TEMP_BUFFER_MAX = 100_000       # unsent records kept (about 35 days); beyond it the oldest go, with an event
+TEMP_BUFFER_MAX = 100_000       # unsent records kept (35 days if every sample were recorded, much longer in practice); beyond it the oldest go, with an event
 TEMP_SYNC_IDLE_SECONDS = 10     # how often an idle uploader looks for work it was not told about
 TEMP_SYNC_BACKOFF_BASE = 5      # seconds before the first retry after a failed upload, doubling ...
 TEMP_SYNC_BACKOFF_MAX = 120     # ... up to this

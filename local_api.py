@@ -273,11 +273,17 @@ class LocalApi:
                     return self._json(200, {"authenticated": self._authed(), "pin_set": api.auth.pin_set()})
                 if path == "/api/temp-history":
                     # the same shape as Firebase temp_history, so the web app parses both alike
+                    query = parse_qs(urlsplit(self.path).query)
                     try:
-                        since = int(parse_qs(urlsplit(self.path).query).get("since", ["0"])[0])
+                        since = int(query.get("since", ["0"])[0])
                     except ValueError:
                         return self._json(400, {"error": "invalid_since"})
-                    rows = api.store.temp_history_since(max(0, since))
+                    # carry=1 adds the newest record from before `since`: records are written only on change, so a
+                    # steady chamber has none inside the window, and the chart holds this one from the left edge
+                    if query.get("carry", ["0"])[0] == "1":
+                        rows = api.store.temp_history_since(max(0, since), carry=True)
+                    else:
+                        rows = api.store.temp_history_since(max(0, since))
                     return self._json(200, {r["rid"]: temp_history.payload(r) for r in rows} or None)
                 if path.startswith("/api/task-logs/"):
                     task_id = path[len("/api/task-logs/"):]

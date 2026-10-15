@@ -22,8 +22,10 @@ class FakeStore:
         {"rid": "1800000030000", "t_ms": 1_800_000_030_000, "bottom": 30.4, "middle": None, "top": 28.2},
     ]
 
-    def temp_history_since(self, since_ms):
-        return [r for r in self.ROWS if r["t_ms"] >= since_ms]
+    def temp_history_since(self, since_ms, carry=False):
+        rows = [r for r in self.ROWS if r["t_ms"] >= since_ms]
+        before = [r for r in self.ROWS if r["t_ms"] < since_ms]
+        return ([before[-1]] if carry and before else []) + rows
 
 
 @pytest.fixture
@@ -185,6 +187,16 @@ def test_temp_history_since_returns_only_newer_records_and_null_when_there_are_n
     _, raw = call(api, "GET", "/api/temp-history?since=1900000000000")
     assert json.loads(raw) is None
     assert call(api, "GET", "/api/temp-history?since=abc")[0].status == 400
+
+
+def test_temp_history_carry_adds_the_newest_record_from_before_the_window(api):
+    # records are written only on change, so a steady chamber has none inside the window to hold the line from
+    _, raw = call(api, "GET", "/api/temp-history?since=1800000030000&carry=1")
+    assert list(json.loads(raw)) == ["1800000000000", "1800000030000"]
+    _, raw = call(api, "GET", "/api/temp-history?since=1900000000000&carry=1")
+    assert list(json.loads(raw)) == ["1800000030000"]  # nothing newer, so the last record alone
+    _, raw = call(api, "GET", "/api/temp-history?since=1700000000000&carry=1")
+    assert list(json.loads(raw)) == ["1800000000000", "1800000030000"]  # nothing before the window to carry
 
 
 def test_static_files_spa_fallback_and_cache_headers(api):

@@ -18,11 +18,16 @@ from tests.conftest import Clock, FakeBase
 
 
 def make_cfg(**over):
-    """The real config with a small history, so a handful of readings exercise batching and trimming."""
+    """The real config with a small history, so a handful of readings exercise batching and trimming.
+
+    The change limit is 0 here: these tests are about delivering, trimming and buffering, and want a record for
+    every sample. The tests of recording only on change ask for the real limit.
+    """
     cfg = SimpleNamespace(**{k: getattr(config, k) for k in dir(config) if k.isupper()})
     cfg.__dict__.update(TEMP_HISTORY_RETENTION=10, TEMP_HISTORY_BATCH=4, TEMP_LOCAL_KEEP=10, TEMP_BUFFER_MAX=1000,
                         TEMP_SYNC_BACKOFF_BASE=5, TEMP_SYNC_BACKOFF_MAX=120, TEMP_SYNC_IDLE_SECONDS=10,
-                        INTERNET_PROBE_BACKOFF_BASE=10, INTERNET_PROBE_BACKOFF_MAX=120)
+                        INTERNET_PROBE_BACKOFF_BASE=10, INTERNET_PROBE_BACKOFF_MAX=120,
+                        TEMP_HISTORY_MIN_CHANGE_C=0.0)
     cfg.__dict__.update(over)
     return cfg
 
@@ -128,6 +133,164 @@ def test_each_record_has_the_sensors_that_read_and_a_dead_sensor_is_left_out(env
     assert last == {"t": rows[1]["t_ms"], "bottom": 30.0, "top": 28.0}  # no middle key at all, not null or 0
 
 
+# ---------------- recording only on change ----------------
+@pytest.fixture
+def steady(tmp_path):
+    """The real 1 C limit: a sample is recorded only if a sensor moved."""
+    e = Env(tmp_path, TEMP_HISTORY_MIN_CHANGE_C=1.0)
+    yield e
+    for s in e.stores:
+        s.close()
+
+
+def sample(e, **values):
+    """One sample 30 s later, with some sensors set to a new value (None: no reading). Returns the row id or None."""
+    e.zones.values.update(values)
+    e.clock.advance(e.cfg.TEMP_HISTORY_INTERVAL_SECONDS)
+    return e.recorder.sample_once()
+
+
+def stored(e):
+    return [(r["bottom"], r["middle"], r["top"], r["gap"]) for r in e.store.temp_history_since(0)]
+
+
+def test_a_steady_temperature_is_recorded_once_however_long_it_stays(steady):
+    assert sample(steady) is not None                  # the first sample has nothing to compare with
+    assert [sample(steady) for _ in range(120)] == [None] * 120   # an hour of the same readings
+    assert stored(steady) == [(30.0, 29.0, 28.0, 1)]
+
+
+def test_a_change_under_1_c_is_not_recorded_and_1_c_is_in_either_direction(steady):
+    sample(steady)                                     # recorded: 30.0
+    assert sample(steady, bottom=30.4) is None
+    assert sample(steady, bottom=30.99) is None
+    assert sample(steady, bottom=29.2) is None         # 0.8 lower
+    assert sample(steady, bottom=31.0) is not None     # exactly 1 C higher than the last RECORDED value
+    assert sample(steady, bottom=31.9) is None         # the next one is judged against 31.0, not against 30.99
+    assert sample(steady, bottom=30.0) is not None     # exactly 1 C lower
+    assert [row[0] for row in stored(steady)] == [30.0, 31.0, 30.0]
+
+
+def test_a_slow_drift_is_recorded_when_it_adds_up_to_1_c_since_the_last_record(steady):
+    sample(steady)
+    for temp in (30.2, 30.4, 30.6, 30.8):
+        assert sample(steady, bottom=temp) is None     # each step is small, and so is the total so far
+    assert sample(steady, bottom=31.0) is not None     # the total since the last record reached 1 C
+    assert [row[0] for row in stored(steady)] == [30.0, 31.0]
+
+
+@pytest.mark.parametrize("zone", ["bottom", "middle", "top"])
+def test_the_same_limit_applies_to_every_sensor(steady, zone):
+    sample(steady)
+    base = steady.zones.values[zone]
+    assert sample(steady, **{zone: base + 0.9}) is None
+    assert sample(steady, **{zone: base + 1.0}) is not None
+    assert sample(steady, **{zone: base + 1.0 - 1.9}) is not None   # and 1 C or more lower
+    assert len(stored(steady)) == 3
+
+
+def test_a_record_holds_every_sensors_current_reading_not_only_the_one_that_moved(steady):
+    sample(steady)
+    sample(steady, top=26.5)                           # the top moved 1.5 C; the others drifted a little
+    steady.zones.values.update(bottom=30.3, middle=29.4)
+    sample(steady, top=26.5)
+    assert sample(steady, top=27.6) is not None
+    assert stored(steady)[-1][:3] == (30.3, 29.4, 27.6)
+
+
+def test_a_sensor_that_starts_or_stops_reading_is_a_change_however_small(steady):
+    sample(steady)
+    assert sample(steady, middle=None) is not None     # a fault must show up
+    assert sample(steady, middle=None) is None         # and being dead is not a new change
+    assert sample(steady, middle=29.0) is not None     # coming back is
+    assert [row[1] for row in stored(steady)] == [29.0, None, 29.0]
+    assert [row[3] for row in stored(steady)] == [1, 0, 0]  # a sensor dropping out is not a break in the history
+
+
+def test_the_first_record_after_a_restart_is_kept_and_flagged_even_if_nothing_changed(steady):
+    sample(steady)
+    sample(steady, bottom=32.0)
+    steady.reboot()                                    # the service restarted: the comparison baseline is gone
+    assert sample(steady) is not None                  # same 32.0 as before, but nothing says it continued
+    assert sample(steady) is None
+    assert [row[3] for row in stored(steady)] == [1, 0, 1]
+
+
+def test_the_first_record_after_every_sensor_failed_is_flagged_even_if_nothing_changed(steady):
+    sample(steady)
+    assert sample(steady, bottom=None, middle=None, top=None) is None   # nothing measured, nothing recorded
+    assert sample(steady, bottom=None, middle=None, top=None) is None
+    assert len(stored(steady)) == 1
+    assert sample(steady, bottom=30.0, middle=29.0, top=28.0) is not None
+    assert [row[3] for row in stored(steady)] == [1, 1]
+
+
+def test_the_gap_flag_reaches_firebase_only_on_the_records_that_have_it(steady):
+    sample(steady)
+    sample(steady, bottom=33.0)
+    steady.settle()
+    first, second = (steady.base.data["temp_history"][k] for k in steady.remote())
+    assert first["gap"] is True and "gap" not in second
+
+
+def test_a_steady_temperature_sends_nothing_to_firebase(steady):
+    sample(steady)
+    steady.settle()
+    updates = steady.base.updates
+    for _ in range(100):
+        sample(steady)
+        steady.uploader.tick()
+    assert steady.base.updates == updates and steady.pending_rows() == 0
+    assert len(steady.remote()) == 1
+
+
+def test_a_reading_taken_before_the_clock_synced_is_still_only_recorded_when_it_changed(steady):
+    steady.clock.synced = False
+    sample(steady)
+    assert sample(steady) is None
+    assert sample(steady, bottom=32.0) is not None
+    steady.clock.advance(30)
+    steady.clock.wall = 1_900_000_000.0
+    steady.clock.synced = True
+    steady.recorder.sample_once()                      # places the two waiting rows; nothing new changed
+    steady.settle()
+    assert len(steady.remote()) == 2
+
+
+def test_the_local_history_can_carry_the_record_from_before_a_window(steady):
+    sample(steady)
+    sample(steady, bottom=33.0)
+    newest = steady.store.temp_history_since(0)[-1]["t_ms"]
+    assert [r["t_ms"] for r in steady.store.temp_history_since(newest + 1)] == []
+    carried = steady.store.temp_history_since(newest + 1, carry=True)
+    assert [(r["t_ms"], r["bottom"]) for r in carried] == [(newest, 33.0)]
+    assert [r["t_ms"] for r in steady.store.temp_history_since(0, carry=True)] == \
+        [r["t_ms"] for r in steady.store.temp_history_since(0)]
+
+
+def test_a_database_from_before_the_gap_flag_is_upgraded_and_its_old_rows_continue(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.db"
+    db = sqlite3.connect(path)
+    db.executescript("""
+        CREATE TABLE temp_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, rid TEXT UNIQUE, boot_id TEXT NOT NULL, mono REAL NOT NULL,
+            wall REAL NOT NULL, clock_synced INTEGER NOT NULL, t_ms INTEGER, bottom REAL, middle REAL, top REAL,
+            synced INTEGER NOT NULL DEFAULT 0);
+        INSERT INTO temp_history(rid, boot_id, mono, wall, clock_synced, t_ms, bottom, synced)
+            VALUES ('1000000000000', 'b', 1, 1, 1, 1000000000000, 30.5, 1);
+    """)
+    db.commit()
+    db.close()
+    store = TaskStore(path, "boot-new", lambda: True)
+    try:
+        assert [(r["bottom"], r["gap"]) for r in store.temp_history_since(0)] == [(30.5, 0)]
+        store.add_temp_reading({"bottom": 31.0}, 2.0, gap=True)
+        assert [r["gap"] for r in store.temp_history_since(0)] == [0, 1]
+    finally:
+        store.close()
+
+
 def test_a_new_reading_wakes_the_uploader(env):
     assert not env.uploader._wake.is_set()
     env.record()
@@ -164,7 +327,8 @@ def test_reconnecting_uploads_the_backlog_oldest_first_and_only_then_forgets_it(
     assert env.local_keys() == expected
     assert env.pending_rows() == 0 and env.pending.value == 0
     first = env.base.data["temp_history"][expected[0]]
-    assert first == {"t": 1_800_000_030_000, "bottom": 30.0, "middle": 29.0, "top": 28.0}
+    # the first record since the recorder started continues nothing, and says so
+    assert first == {"t": 1_800_000_030_000, "bottom": 30.0, "middle": 29.0, "top": 28.0, "gap": True}
 
 
 # 8, 9

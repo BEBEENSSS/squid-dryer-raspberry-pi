@@ -3,6 +3,10 @@
 A record is keyed by its collection time in ms, zero-padded so the keys sort by time. The key is the record id:
 sending the same record twice writes the same path, so a retry can never create a duplicate, and a backlog that
 arrives late still lands at the time it was taken.
+
+Records are written only when something changed (`worth_recording`), so the time between two records says nothing
+about an outage. A record flagged `gap` is the one that says it: nothing was recorded before it that it continues.
+The web app (src/lib/temp-history.ts) applies the same rule to its live readings and draws a break before a `gap`.
 """
 
 import math
@@ -26,12 +30,26 @@ def clean_readings(temps):
     return {zone: float(temps[zone]) for zone in SENSORS if _number(temps.get(zone))}
 
 
+def worth_recording(last, readings, min_change):
+    """Whether `readings` ({zone: °C}) earn a new record after the previous one, which held `last`.
+
+    Every sensor is judged by the same limit against its own value in that record: one moving `min_change` or
+    more is enough, and a sensor that started or stopped reading counts as a change too (a fault must show). With
+    no previous record to continue (`last` is None) the answer is always yes.
+    """
+    if last is None or readings.keys() != last.keys():
+        return True
+    return any(abs(readings[zone] - last[zone]) >= min_change - 1e-9 for zone in readings)
+
+
 def payload(row):
-    """The Firebase record for a local row (a dict with t_ms and the three sensor columns)."""
+    """The Firebase record for a local row (a dict with t_ms, the three sensor columns and optionally gap)."""
     out = {"t": int(row["t_ms"])}
     for zone in SENSORS:
         if _number(row.get(zone)):
             out[zone] = round(float(row[zone]), 2)
+    if row.get("gap"):
+        out["gap"] = True
     return out
 
 

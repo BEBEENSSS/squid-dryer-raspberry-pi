@@ -122,6 +122,7 @@ CREATE TABLE IF NOT EXISTS temp_history (
     bottom REAL,
     middle REAL,
     top REAL,
+    gap INTEGER NOT NULL DEFAULT 0,     -- 1: not a continuation of the record before it (first since a start, or after every sensor failed)
     synced INTEGER NOT NULL DEFAULT 0   -- 1 once Firebase has confirmed the record
 );
 CREATE INDEX IF NOT EXISTS temp_history_pending ON temp_history (t_ms) WHERE synced=0;
@@ -176,6 +177,9 @@ class TaskStore:
             # databases created before the middle and top sensors: every sample so far is the bottom sensor's
             if "zone" not in [r["name"] for r in c.execute("PRAGMA table_info(temp_log)")]:
                 c.execute("ALTER TABLE temp_log ADD COLUMN zone TEXT NOT NULL DEFAULT 'bottom'")
+            # databases created before records were written only on change: every row so far continues the last
+            if "gap" not in [r["name"] for r in c.execute("PRAGMA table_info(temp_history)")]:
+                c.execute("ALTER TABLE temp_history ADD COLUMN gap INTEGER NOT NULL DEFAULT 0")
 
     @staticmethod
     def _ensure_temp_minutes(c):
@@ -402,9 +406,10 @@ class TaskStore:
             t_ms += 1
         return t_ms
 
-    def add_temp_reading(self, readings, mono):
+    def add_temp_reading(self, readings, mono, gap=False):
         """Store one reading per sensor ({zone: °C}, only zones that have one). Returns the row id.
 
+        `gap` marks a record that does not continue the one before it, so a chart breaks the line there.
         With a synced clock the record gets its time and id at once. Otherwise it waits, with its monotonic
         time, for place_temp_history: a wall clock that is not synced would date it wrongly.
         """
@@ -412,10 +417,10 @@ class TaskStore:
         with self._conn() as c:
             t_ms = self._free_t(c, int(round(wall * 1000))) if synced else None
             cur = c.execute(
-                "INSERT INTO temp_history(rid, boot_id, mono, wall, clock_synced, t_ms, bottom, middle, top) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO temp_history(rid, boot_id, mono, wall, clock_synced, t_ms, bottom, middle, top, gap) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (record_key(t_ms) if synced else None, self.boot_id, mono, wall, int(synced), t_ms,
-                 *(readings.get(zone) for zone in SENSORS)))
+                 *(readings.get(zone) for zone in SENSORS), int(bool(gap))))
             return cur.lastrowid
 
     def place_temp_history(self, mono_now):
@@ -452,11 +457,22 @@ class TaskStore:
         with self._conn() as c:
             c.executemany("UPDATE temp_history SET synced=1 WHERE id=?", [(i,) for i in ids])
 
-    def temp_history_since(self, since_ms, limit=100_000):
-        """Dated readings from `since_ms` on, oldest first, delivered or not (the local panel shows both)."""
-        return [dict(r) for r in self._conn().execute(
-            "SELECT rid, t_ms, bottom, middle, top FROM temp_history WHERE t_ms IS NOT NULL AND t_ms>=? "
+    def temp_history_since(self, since_ms, limit=100_000, carry=False):
+        """Dated readings from `since_ms` on, oldest first, delivered or not (the local panel shows both).
+
+        Records are written only on change, so a steady chamber may have none inside a window. `carry` adds the
+        newest one from before `since_ms`: the value the chart holds from the left edge of the window.
+        """
+        rows = [dict(r) for r in self._conn().execute(
+            "SELECT rid, t_ms, bottom, middle, top, gap FROM temp_history WHERE t_ms IS NOT NULL AND t_ms>=? "
             "ORDER BY t_ms LIMIT ?", (since_ms, limit))]
+        if carry:
+            before = self._conn().execute(
+                "SELECT rid, t_ms, bottom, middle, top, gap FROM temp_history WHERE t_ms IS NOT NULL AND t_ms<? "
+                "ORDER BY t_ms DESC LIMIT 1", (since_ms,)).fetchone()
+            if before is not None:
+                rows.insert(0, dict(before))
+        return rows
 
     def prune_temp_history(self, keep, buffer_max):
         """Drop delivered readings beyond the newest `keep`. Undelivered ones go only past `buffer_max`, the cap
