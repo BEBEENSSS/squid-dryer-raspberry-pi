@@ -17,13 +17,26 @@ W1_BASE = Path("/sys/bus/w1/devices")
 SENSOR_INTERVAL = 2             # seconds between reads
 SENSOR_BAD_LIMIT = 3            # this many bad reads in a row -> sensor failed
 SENSOR_STALE_SECONDS = 10       # no good read for this long -> sensor failed
-TEMP_MAX_C = 60.0               # firmware ceiling for the over-temperature fault, and the default maximum
-TEMP_RESUME_DROP = 5.0          # heater can be re-enabled once this far below max
-# The maximum is an operator setting (settings/temp_max_c), saved on the Pi. It can go lower than TEMP_MAX_C,
-# never higher, and must stay at least TEMP_MAX_GAP_C above the target so normal overshoot cannot trip the fault.
-TEMP_MAX_MIN_C = 35.0           # mirrors database.rules.json
-TEMP_MAX_MAX_C = TEMP_MAX_C
+TEMP_MAX_C = 60.0               # the absolute limit: firmware ceiling for the safe shutdown, and its default
+TEMP_RESUME_DROP = 5.0          # heater can be re-enabled once this far below the safe shutdown temperature
+# Temperature limits, lowest to highest. Each has one job and the order is enforced everywhere
+# (machine_settings.limits_error, the web app and database.rules.json use the same numbers):
+#   target (manual_target_temp_c)  the temperature the thermostat holds
+#   heater pause (heater_cutoff_c) heater paused at/above it on the HOTTEST sensor, resumes by itself, task goes on
+#   safe shutdown (temp_max_c)     hottest sensor at/above it: heater off, task failed, manual heating off, alert
+#   TEMP_MAX_C                     absolute limit, never an operator setting
+# The safe shutdown temperature is saved on the Pi (settings/temp_max_c). It can go lower than TEMP_MAX_C,
+# never higher, and must stay at least TEMP_MAX_GAP_C above the target so normal overshoot cannot trip it.
+MANUAL_TARGET_TEMP_MIN_C = 45.0  # mirrors database.rules.json
+MANUAL_TARGET_TEMP_MAX_C = 55.0  # the highest target there is; the safe shutdown temperature is always above it
 TEMP_MAX_GAP_C = TEMP_RESUME_DROP
+TEMP_MAX_MAX_C = TEMP_MAX_C
+TEMP_MAX_MIN_C = MANUAL_TARGET_TEMP_MIN_C + TEMP_MAX_GAP_C   # 50; mirrors database.rules.json
+# The pause sits strictly between the target and the safe shutdown temperature, so it can act before the shutdown.
+CUTOFF_TARGET_GAP_C = 1.0       # pause at least this far above the target
+CUTOFF_SHUTDOWN_GAP_C = 1.0     # ...and at least this far below the safe shutdown temperature
+# "Approaching safe shutdown" is reported when the hottest sensor is within this of the safe shutdown temperature.
+SHUTDOWN_WARN_MARGIN_C = 2.0
 
 # ---------------- chamber zones: one DS18B20 per 1-Wire bus ----------------
 # bottom = sensor 1 (GPIO4, near the heater and fan), middle = sensor 2 (GPIO22), top = sensor 3 (GPIO23).
@@ -60,18 +73,18 @@ HEATER_MIN_RISE_C = 2.0
 # The target is one setting for manual heating and for drying tasks. Until a valid saved value exists it is
 # 5 C below the default maximum, which is where tasks always ran before the target was configurable.
 MANUAL_TARGET_TEMP_C = TEMP_MAX_C - TEMP_RESUME_DROP  # defaults, used until valid saved values exist
-MANUAL_TARGET_TEMP_MIN_C = 30.0  # mirrors database.rules.json
-MANUAL_TARGET_TEMP_MAX_C = 55.0
 MANUAL_HYSTERESIS_C = 2.0       # manual heater back on at target - hysteresis
 MANUAL_TARGET_HUMIDITY = 60.0   # stored and reported only, there is no humidity sensor
 MANUAL_TARGET_HUMIDITY_MIN = 20.0
 MANUAL_TARGET_HUMIDITY_MAX = 80.0
 
-# heater cut-off (settings/heater_cutoff_c): heater off at or above it, on again `margin` below it.
-# Applies to manual mode and tasks. TEMP_MAX_C stays the separate hard fault above it.
-HEATER_CUTOFF_C = 58.0          # default, above the task setpoint so tasks behave as before
-HEATER_CUTOFF_MIN_C = 30.0      # mirrors database.rules.json
-HEATER_CUTOFF_MAX_C = 58.0
+# heater pause (settings/heater_cutoff_c, the key keeps its old name): heater off while the HOTTEST healthy sensor is at
+# or above it, on again `margin` below it. Applies to manual mode and tasks. Unlike the thermostat, which reads the
+# bottom sensor only, it sees a hot spot elsewhere in the chamber. The safe shutdown temperature stays the separate
+# hard stop above it.
+HEATER_CUTOFF_C = 58.0          # default: above the default target, below the default safe shutdown temperature
+HEATER_CUTOFF_MIN_C = MANUAL_TARGET_TEMP_MIN_C + CUTOFF_TARGET_GAP_C    # 46; mirrors database.rules.json
+HEATER_CUTOFF_MAX_C = TEMP_MAX_MAX_C - CUTOFF_SHUTDOWN_GAP_C            # 59
 HEATER_CUTOFF_MARGIN_C = 3.0    # recovery margin, prevents rapid switching around the limit
 
 # ---------------- drying tasks ----------------

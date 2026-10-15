@@ -15,9 +15,9 @@
           ".write": "auth != null && auth.uid === 'MmpK3i6OsnR6RbSGMRHm2M9U5cJ2'",
           ".validate": "newData.hasChildren(['updated_at'])",
           "safe_temp_c": { ".validate": "newData.isNumber() && newData.val() >= 25 && newData.val() <= 50" },
-          "heater_cutoff_c": { ".validate": "newData.isNumber() && newData.val() >= 30 && newData.val() <= 58" },
-          "manual_target_temp_c": { ".validate": "newData.isNumber() && newData.val() >= 30 && newData.val() <= 55" },
-          "temp_max_c": { ".validate": "newData.isNumber() && newData.val() >= 35 && newData.val() <= 60" },
+          "heater_cutoff_c": { ".validate": "newData.isNumber() && newData.val() >= 46 && newData.val() <= 59" },
+          "manual_target_temp_c": { ".validate": "newData.isNumber() && newData.val() >= 45 && newData.val() <= 55" },
+          "temp_max_c": { ".validate": "newData.isNumber() && newData.val() >= 50 && newData.val() <= 60" },
           "manual_target_humidity": { ".validate": "newData.isNumber() && newData.val() >= 20 && newData.val() <= 80" },
           "updated_at": { ".validate": "newData.val() == now" },
           "changed_at": {

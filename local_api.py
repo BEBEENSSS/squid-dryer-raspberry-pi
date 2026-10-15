@@ -155,10 +155,11 @@ def parse_settings(body):
         if not _is_number(value) or not getattr(config, lo) <= value <= getattr(config, hi):
             return None, f"out_of_range:{key}"
         out[key] = float(value)
-    # a body carrying both can be judged here; with only one, the machine checks it against the saved other
-    target, maximum = out.get(machine_settings.TARGET_KEY), out.get(machine_settings.MAX_KEY)
-    if target is not None and maximum is not None and not machine_settings.gap_ok(target, maximum):
-        return None, "target_max_gap"
+    # the order target < heater pause < safe shutdown is judged here for the values the body carries; a value it
+    # leaves out is checked by the machine against the one it has saved
+    if machine_settings.limits_error(out.get(machine_settings.TARGET_KEY), out.get(machine_settings.CUTOFF_KEY),
+                                     out.get(machine_settings.MAX_KEY)):
+        return None, "temperature_order"
     return out, None
 
 

@@ -19,6 +19,7 @@ from command_age import LocalCommandMark  # noqa: E402
 from hardware import Outputs, Sensor, SensorArray, make_reader  # noqa: E402
 from link_monitor import LinkMonitor  # noqa: E402
 from local_api import LocalApi  # noqa: E402
+from machine_settings import shutdown_warning  # noqa: E402
 from netinfo import lan_ip, read_network_status  # noqa: E402
 from network_control import NetworkControl, network_ack_payload  # noqa: E402
 from snapshot import build_snapshot, zone_state  # noqa: E402
@@ -165,15 +166,16 @@ class ManualControl:
             return self._disable("heater off: temperature sensor failed", "sensor_fault")
         hot = self.tm.hottest()  # the hottest healthy sensor, so a hot spot sensor 1 cannot see still counts
         hot = temp if hot is None else hot
-        if hot >= self.tm.temp_max_c:  # the saved maximum, read locally, so it holds without the network
-            return self._disable(f"heater off: over temperature ({hot:.1f} C)", "over_temperature")
+        if hot >= self.tm.temp_max_c:  # the saved safe shutdown temperature, read locally, so it holds without the network
+            return self._disable(f"heater off: safe shutdown temperature reached ({hot:.1f} C)", "over_temperature")
         if not self.out.fan.is_active:
             return self._disable("heater off: fan is not running", "no_fan")
         if self.out.heater.latched:
             return self._disable(f"heater off: {self.out.heater.latched}", self.out.heater.latched)
 
         settings = self.tm.settings
-        cut = self.tm.cutoff.update(temp, settings.get("heater_cutoff_c"))
+        # the pause goes by the hottest sensor, unlike the thermostat below (bottom sensor): a hot spot it cannot see
+        cut = self.tm.cutoff.update(hot, settings.get("heater_cutoff_c"))
         target = settings.get("manual_target_temp_c")
         if cut or temp >= target:
             self.heater_off()
@@ -196,8 +198,9 @@ class ManualControl:
             self._regulate()
         elif self.out.heater.is_active:
             self.heater_off()  # nothing asked for heat, so nothing may be heating
-        # keep the cut-off latch current while idle so the dashboard shows the real condition
-        self.tm.cutoff.update(self.sensor.temp(), self.tm.settings.get("heater_cutoff_c"))
+        # keep the pause latch current while idle so the dashboard shows the real condition
+        hot = self.tm.hottest()
+        self.tm.cutoff.update(self.sensor.temp() if hot is None else hot, self.tm.settings.get("heater_cutoff_c"))
 
 
 def main():
@@ -270,7 +273,8 @@ def main():
         net = network_status() or {}  # empty when netwatch is not running: the keys are then removed
         # a new task may start while cooling once the machine is cool enough to accept it
         hot = tm.hottest()
-        cool_enough = ok and (sensor.temp_c if hot is None else hot) < tm.temp_max_c - config.TEMP_RESUME_DROP
+        hottest_c = (sensor.temp_c if hot is None else hot) if ok else None
+        cool_enough = ok and hottest_c < tm.temp_max_c - config.TEMP_RESUME_DROP
         return {
             "fan": out.fan.is_active,
             "heater": out.heater.is_active,
@@ -278,7 +282,13 @@ def main():
             "temp": round(sensor.temp_c, 1) if ok else None,  # None removes the key
             "sensor_ok": ok,
             **zone_state(zones),
-            "temp_max": tm.temp_max_c,  # the maximum the machine enforces, not a target
+            "temp_max": tm.temp_max_c,  # the safe shutdown temperature the machine enforces, not a target
+            # the hottest healthy sensor: what the pause and the shutdown go by (None removes the key)
+            "temp_hottest": round(hottest_c, 1) if hottest_c is not None else None,
+            # the machine's own verdict, so the web app and the local panel never re-derive it: close to the
+            # shutdown temperature but not there yet (at it, heater_block says over_temperature)
+            "shutdown_warning": shutdown_warning(hottest_c, tm.temp_max_c, config.SHUTDOWN_WARN_MARGIN_C),
+            "shutdown_warn_margin": config.SHUTDOWN_WARN_MARGIN_C,
             "status": machine,
             "cooling": tm.cooling_active(),
             "safe_temp": tm.safe_temp_c,

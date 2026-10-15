@@ -223,7 +223,7 @@ class TaskManager:
 
     @property
     def temp_max_c(self):
-        """The saved maximum temperature: the over-temperature limit for manual heating and for new tasks."""
+        """The saved safe shutdown temperature: the over-temperature limit for manual heating and for new tasks."""
         return self.settings.get(MAX_KEY)
 
     def task_limit(self, task):
@@ -507,13 +507,14 @@ class TaskManager:
                               {"zone": zone, "last_valid_temp_c": sensor.temp_c, "bad_reads": sensor.bad_reads})
                     return False
 
-        # thermostat, never heat without airflow. The cut-off only pauses heating: the timer,
-        # checkpoints and fan carry on, and the fault checks above stay independent of it.
+        # thermostat, never heat without airflow. The pause only pauses heating: the timer,
+        # checkpoints and fan carry on, and the fault checks above stay independent of it. It goes by the
+        # hottest sensor (`hot`), the thermostat below by the control sensor (`temp`).
         self.out.fan.on()
         if self.out.heater.latched:  # runtime guard: stays failed until the operator acknowledges
             self._end("failed", self.out.heater.latched, now, {"temp_c": temp})
             return False
-        cut = self.cutoff.update(temp, self.heater_cutoff_c)
+        cut = self.cutoff.update(hot, self.heater_cutoff_c)
         if cut or temp >= t["target_c"]:
             self.out.heater.off()
         elif temp <= t["target_c"] - t["hysteresis_c"] and self.out.fan.is_active:

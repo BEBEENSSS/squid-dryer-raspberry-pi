@@ -28,16 +28,41 @@ FIELDS = {
                                "MANUAL_TARGET_HUMIDITY_MIN", "MANUAL_TARGET_HUMIDITY_MAX"),
 }
 
-# The target is one setting for manual heating and for drying tasks (the key keeps its old name so saved
-# values and the database rules carry over). The maximum is the over-temperature limit, never a target.
+# Three temperatures, lowest to highest (the keys keep their old names so saved values and the database rules carry
+# over). The target is one setting for manual heating and for drying tasks. The heater pause only pauses the heater.
+# The maximum is the safe shutdown temperature, the hard stop, and is never a target.
 TARGET_KEY = "manual_target_temp_c"
+CUTOFF_KEY = "heater_cutoff_c"
 MAX_KEY = "temp_max_c"
+LIMIT_KEYS = (TARGET_KEY, CUTOFF_KEY, MAX_KEY)
 
 
-def gap_ok(target, maximum, cfg=config):
-    """The maximum has to sit at least TEMP_MAX_GAP_C above the target, or the thermostat's normal
-    overshoot would trip the over-temperature fault."""
-    return maximum - target >= float(cfg.TEMP_MAX_GAP_C) - 1e-9
+def limits_error(target, cutoff, maximum, cfg=config):
+    """Why target < heater pause < safe shutdown does not hold, or None when it does.
+
+    Any argument may be None (a value the caller does not have): the checks that need it are skipped.
+    The safe shutdown temperature must sit TEMP_MAX_GAP_C above the target or the thermostat's normal overshoot
+    would trip it; the pause has to sit between the two, or it could never act before the shutdown (or, below
+    the target, it would quietly act as a second, lower target)."""
+    def too_close(low, high, gap):
+        return low is not None and high is not None and high - low < float(gap) - 1e-9
+
+    if too_close(target, maximum, cfg.TEMP_MAX_GAP_C):
+        return f"the safe shutdown temperature must be at least {cfg.TEMP_MAX_GAP_C:g} C above the target"
+    if too_close(target, cutoff, cfg.CUTOFF_TARGET_GAP_C):
+        return f"the heater pause temperature must be at least {cfg.CUTOFF_TARGET_GAP_C:g} C above the target"
+    if too_close(cutoff, maximum, cfg.CUTOFF_SHUTDOWN_GAP_C):
+        return (f"the heater pause temperature must be at least {cfg.CUTOFF_SHUTDOWN_GAP_C:g} C below "
+                f"the safe shutdown temperature")
+    return None
+
+
+def shutdown_warning(hottest, maximum, margin):
+    """True while the hottest healthy sensor is within `margin` of the safe shutdown temperature but not at it.
+
+    At or above it the shutdown has happened (heater_block says over_temperature), so that is not a warning.
+    This is the machine's verdict, published in state/shutdown_warning, so every panel shows the same one."""
+    return hottest is not None and maximum - margin <= hottest < maximum
 
 
 class MachineSettings:
@@ -46,7 +71,7 @@ class MachineSettings:
         self.cfg = cfg
         self.lock = threading.RLock()
         self.values = {key: self._load(key) for key in FIELDS}
-        self._settle_pair()
+        self._settle_limits()
         self.updated_at = self._load_updated_at()
         self.stamps = self._load_stamps()  # per setting: the time of the newest request seen for it
 
@@ -66,25 +91,38 @@ class MachineSettings:
         # a corrupt or out-of-range saved value must never reach the control logic
         if value is not None and self.valid(key, value):
             return value
+        # A temperature limit saved when the ranges were wider (the target used to go down to 30) and now sits
+        # below the lowest allowed value moves up to it; the default could be far hotter than what was saved.
+        if value is not None and key in LIMIT_KEYS and _number(value) and value < getattr(self.cfg, FIELDS[key][2]):
+            moved = float(getattr(self.cfg, FIELDS[key][2]))
+            self.store.log_event("config_migrated", f"saved {key} {raw!r} is below the allowed range, using {moved:.1f}",
+                                 data={key: moved})
+            return moved
         if raw is not None:
             self.store.log_event("config_warning", f"saved {key} {raw!r} is invalid, using the default")
         return self._default(key)
 
-    def _settle_pair(self):
-        """A saved pair that breaks the gap (corrupt or edited by hand) keeps the maximum, which is the
-        protective limit, and lowers the target. The fallback never loosens the limit."""
-        target, maximum = self.values[TARGET_KEY], self.values[MAX_KEY]
-        if gap_ok(target, maximum, self.cfg):
+    def _settle_limits(self):
+        """Saved temperatures that break the order (corrupt, edited by hand, or from before the pause had to sit
+        between the target and the shutdown) keep the safe shutdown temperature, which is the protective limit,
+        and lower the pause and then the target under it. The fallback never loosens the limit."""
+        target, cutoff, maximum = (self.values[key] for key in LIMIT_KEYS)
+        if limits_error(target, cutoff, maximum, self.cfg) is None:
             return
-        lowered = maximum - float(self.cfg.TEMP_MAX_GAP_C)
-        if self.valid(TARGET_KEY, lowered):
-            self.values[TARGET_KEY] = lowered
+        cfg = self.cfg
+        new_cutoff = min(cutoff, maximum - float(cfg.CUTOFF_SHUTDOWN_GAP_C))
+        new_target = min(target, maximum - float(cfg.TEMP_MAX_GAP_C), new_cutoff - float(cfg.CUTOFF_TARGET_GAP_C))
+        settled = {TARGET_KEY: new_target, CUTOFF_KEY: new_cutoff, MAX_KEY: maximum}
+        if all(self.valid(key, value) for key, value in settled.items()) \
+                and limits_error(new_target, new_cutoff, maximum, cfg) is None:
+            self.values.update(settled)
         else:
-            self.values[TARGET_KEY], self.values[MAX_KEY] = self._default(TARGET_KEY), self._default(MAX_KEY)
+            self.values.update({key: self._default(key) for key in LIMIT_KEYS})
         self.store.log_event(
             "config_warning",
-            f"saved target {target:.1f} C and maximum {maximum:.1f} C break the gap, "
-            f"using {self.values[TARGET_KEY]:.1f} / {self.values[MAX_KEY]:.1f} C")
+            f"saved target {target:.1f} C, heater pause {cutoff:.1f} C and safe shutdown {maximum:.1f} C break "
+            f"the order, using {self.values[TARGET_KEY]:.1f} / {self.values[CUTOFF_KEY]:.1f} / "
+            f"{self.values[MAX_KEY]:.1f} C")
 
     def _load_updated_at(self):
         try:
@@ -120,7 +158,8 @@ class MachineSettings:
             first settings from the cloud).
           * Without `changed_at` (the local panel, or an older web app) `updated_at` is the time of every
             field in the payload, and a payload not newer than the last applied one is ignored.
-        Each field is validated on its own, then the target and maximum together (the gap). A refused
+        Each field is validated on its own, then the target, heater pause and safe shutdown temperature together
+        (`limits_error`; a member that is not in the payload counts with the value in use). A refused
         request is logged, its time is still recorded, and the old value stays, so a restart cannot
         revive it later.
         """
@@ -157,13 +196,14 @@ class MachineSettings:
                     self._reject(key, value, "out of range")
             changed = {key: value for key, value in new.items() if value != self.values[key]}
 
-            pair = {key: value for key, value in changed.items() if key in (TARGET_KEY, MAX_KEY)}
-            if pair and not gap_ok(pair.get(TARGET_KEY, self.values[TARGET_KEY]),
-                                   pair.get(MAX_KEY, self.values[MAX_KEY]), self.cfg):
-                for key, value in pair.items():
-                    self._reject(key, value, f"breaks the gap: maximum must be at least "
-                                             f"{self.cfg.TEMP_MAX_GAP_C:g} C above the target")
-                    del changed[key]
+            limits = {key: value for key, value in changed.items() if key in LIMIT_KEYS}
+            if limits:
+                trial = {key: limits.get(key, self.values[key]) for key in LIMIT_KEYS}
+                why = limits_error(trial[TARGET_KEY], trial[CUTOFF_KEY], trial[MAX_KEY], self.cfg)
+                if why:
+                    for key, value in limits.items():
+                        self._reject(key, value, f"breaks the temperature order: {why}")
+                        del changed[key]
 
             meta = {}
             for key, value in changed.items():

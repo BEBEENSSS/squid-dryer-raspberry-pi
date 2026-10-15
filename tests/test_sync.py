@@ -180,21 +180,31 @@ def test_manual_heating_blocked_after_boot_until_reenabled_then_runs_offline(rig
     assert rig.out.heater.is_active
 
 
-def test_manual_cutoff_overrides_target_and_recovers_with_margin(rig):
-    manual, _, _ = _manual_rig(rig)
-    rig.tm.apply_settings({"manual_target_temp_c": 55, "heater_cutoff_c": 50})
-    _reading(rig, 40)
+def _readings(rig, bottom, top):
+    """The bottom sensor (the thermostat's) and the top one, read at the same moment."""
+    rig.oven.fixed = bottom
+    rig.oven.zone_fixed["top"] = top
+    rig.clock.advance(2)
+    for s in rig.sensors:
+        s.poll()
+
+
+def test_manual_pause_goes_by_the_hottest_sensor_and_recovers_with_margin(zrig):
+    manual, _, _ = _manual_rig(zrig)
+    zrig.tm.apply_settings({"manual_target_temp_c": 47, "heater_cutoff_c": 50})
+    _readings(zrig, bottom=40, top=40)
     manual.apply(True, True)
-    assert rig.out.heater.is_active
-    _reading(rig, 50)
+    assert zrig.out.heater.is_active
+    # a hot spot the thermostat's sensor cannot see: the bottom still asks for heat, the top is at the pause
+    _readings(zrig, bottom=40, top=50)
     manual.tick()
-    assert not rig.out.heater.is_active and rig.tm.cutoff.active and manual.enabled
-    _reading(rig, 48)  # inside the margin: no rapid switching
+    assert not zrig.out.heater.is_active and zrig.tm.cutoff.active and manual.enabled
+    _readings(zrig, bottom=40, top=48)  # inside the margin: no rapid switching
     manual.tick()
-    assert not rig.out.heater.is_active
-    _reading(rig, 47)  # limit - margin: released, heating still wanted
+    assert not zrig.out.heater.is_active
+    _readings(zrig, bottom=40, top=47)  # pause - margin: released, heating still wanted
     manual.tick()
-    assert rig.out.heater.is_active and not rig.tm.cutoff.active
+    assert zrig.out.heater.is_active and not zrig.tm.cutoff.active
 
 
 def test_manual_faults_disable_heating_regardless_of_cutoff(rig):
@@ -218,16 +228,16 @@ def test_manual_faults_disable_heating_regardless_of_cutoff(rig):
 
 def test_manual_over_temperature_fault_is_the_saved_max_even_offline(rig):
     manual, sync, base = _manual_rig(rig)
-    rig.tm.apply_settings({"manual_target_temp_c": 40, "temp_max_c": 46, "updated_at": 1})
+    rig.tm.apply_settings({"manual_target_temp_c": 47, "heater_cutoff_c": 50, "temp_max_c": 52, "updated_at": 1})
     _reading(rig, 35)
     manual.apply(True, True)
     assert rig.out.heater.is_active
-    base.fail = True  # the network is gone: the saved maximum is all the machine has, and it is enough
+    base.fail = True  # the network is gone: the saved safe shutdown temperature is all the machine has, and it is enough
     sync.sync_once()
-    _reading(rig, 45)  # below the saved maximum, far below the old fixed 60
+    _reading(rig, 51)  # past the pause, below the saved shutdown temperature, far below the old fixed 60
     manual.tick()
     assert manual.enabled
-    _reading(rig, 46)
+    _reading(rig, 52)
     manual.tick()
     assert not rig.out.heater.is_active and not manual.enabled and manual.block == "over_temperature"
 

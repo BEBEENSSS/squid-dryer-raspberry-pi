@@ -71,7 +71,7 @@ def test_session_settings_are_frozen_at_start(rig, monkeypatch):
     monkeypatch.setattr(config, "TARGET_TOLERANCE_C", 10.0)
     monkeypatch.setattr(config, "DWELL_SECONDS", 1)
     # the saved target is copied into the task at start: a new target waits for the next task
-    assert rig.tm.apply_settings({"manual_target_temp_c": 40, "updated_at": 1}) == ["manual_target_temp_c"]
+    assert rig.tm.apply_settings({"manual_target_temp_c": 46, "updated_at": 1}) == ["manual_target_temp_c"]
     t = drive_to_drying(rig)
     assert (t["tolerance_c"], t["dwell_s"], t["target_c"]) == (2.5, 60, 55.0)
     assert t["target_confirmed_wall"] - t["drying_started_wall"] >= 60

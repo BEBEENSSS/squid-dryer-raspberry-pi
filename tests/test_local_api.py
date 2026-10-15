@@ -142,14 +142,24 @@ def test_settings_are_range_checked_and_queued_for_the_control_loop(api):
     assert api.queue.get_nowait() == ("settings_local", {"heater_cutoff_c": 50.0})
 
 
-def test_target_and_max_are_checked_together_when_sent_together(api):
+def test_the_temperature_order_is_checked_for_the_values_sent_together(api):
     _, cookie = login(api)
-    # in range each, but only 3 C apart: the maximum must be at least 5 C above the target
+    # in range each, but only 3 C apart: the safe shutdown temperature must be at least 5 C above the target
     resp, raw = call(api, "POST", "/api/settings", {"manual_target_temp_c": 50, "temp_max_c": 53}, cookie)
-    assert resp.status == 400 and json.loads(raw)["error"] == "target_max_gap"
+    assert resp.status == 400 and json.loads(raw)["error"] == "temperature_order"
+    # the pause has to sit above the target and below the safe shutdown temperature
+    for body in ({"manual_target_temp_c": 50, "heater_cutoff_c": 50},
+                 {"manual_target_temp_c": 48, "heater_cutoff_c": 47},
+                 {"heater_cutoff_c": 55, "temp_max_c": 55}):
+        resp, raw = call(api, "POST", "/api/settings", body, cookie)
+        assert resp.status == 400 and json.loads(raw)["error"] == "temperature_order", body
     assert call(api, "POST", "/api/settings", {"temp_max_c": 99}, cookie)[0].status == 400
     assert api.queue.empty()
-    # one alone is queued as given: the machine checks it against the other one it has saved
+    # a valid set is queued whole
+    body = {"manual_target_temp_c": 47, "heater_cutoff_c": 50, "temp_max_c": 52}
+    assert call(api, "POST", "/api/settings", body, cookie)[0].status == 202
+    assert api.queue.get_nowait() == ("settings_local", {k: float(v) for k, v in body.items()})
+    # one alone is queued as given: the machine checks it against the others it has saved
     assert call(api, "POST", "/api/settings", {"temp_max_c": 52}, cookie)[0].status == 202
     assert api.queue.get_nowait() == ("settings_local", {"temp_max_c": 52.0})
 
