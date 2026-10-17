@@ -9,7 +9,8 @@ The Pi is the authority on what the machine is actually doing. Firebase is used 
 | `dryer_cloud.py` | Entry point: control loop, manual fan/heater mode, signals |
 | `task_manager.py` | Drying task state machine, timer, thermostat, safety faults |
 | `warmup.py` | Pure target-temperature detection (moving median + dwell, across all three zones) and dip tracking |
-| `calibration.py` | Per-sensor offsets written by `sensor2_test.py --calibrate` and applied to the middle and top sensors |
+| `calibration.py` | Per-sensor offsets written by `sensor2_test.py --calibrate` and applied to the middle and top sensors (temperature, and humidity for the DHT22) |
+| `dht22.py` | DHT22 temperature + humidity driver (GPIO character device, kernel-timestamped edges). Used by `sensor2_test.py` only; the service does not read it yet |
 | `recovery.py` | Decision after a restart: resume / failed / recovery required |
 | `task_store.py` | SQLite record (`data/dryer.db`): tasks, temperature log, event outbox, processed commands |
 | `cloud_sync.py` | Background Firebase thread: command stream + polling, heartbeat, event upload |
@@ -160,6 +161,10 @@ Which sensor decides what:
 3. Until both are real ids, `state/zones_configured` is false and every start is rejected as `zones_unconfigured`; the service logs a `config_warning` event at start-up.
 
 **Calibration.** `python sensor2_test.py --calibrate` (sensors side by side) matches each extra sensor to sensor 1 and saves one offset per sensor id in `data/sensor2_calibration.json`. The service applies those offsets to the middle and top sensors when it starts (listed in the `device_started` event); **restart `squid-dryer.service` after recalibrating**. Sensor 1 is never offset, whatever the file says.
+
+**Top sensor as a DHT22 (trial, `sensor2_test.py` only).** The top sensor is being changed to a DHT22 on GPIO22 that reads temperature **and** humidity. The service is not switched over yet: it still reads the 1-Wire ids in `ZONE_SENSOR_IDS`, so nothing about the dryer's behaviour changes. `sensor2_test.py` lists the DHT22 as `dht22-gpio22` next to the 1-Wire sensors and counts it in `--expect`. Calibration covers both readings, saved under that id in the same file: temperature is matched to sensor 1 like the other extra sensors, humidity (`offset_rh`) only when `--true-humidity PCT` gives a trusted hygrometer reading, because the Pi has no humidity reference of its own. Calibrating one leaves the other offset as it was, and `--raw` shows both uncalibrated. `--no-dht` leaves the DHT22 out and `--dht-pin` moves it to another GPIO.
+
+**GPIO22 must have no 1-Wire overlay.** A `dtoverlay=w1-gpio,gpiopin=22` line in `/boot/firmware/config.txt` makes the kernel own the pin, and the DHT22 read fails as "busy". Delete that line and reboot, or free the pin until the next boot with `echo onewire@16 | sudo tee /sys/bus/platform/drivers/w1-gpio/unbind`. Wire the DHT22 data pin to GPIO22 with a 10 k pull-up to 3V3 (a 3-pin module already has one), VCC to 3V3 and GND to GND.
 
 **Starting without a sensor.** If the middle or top sensor is not reading, a start is rejected (`zone_sensor_unavailable`) unless the operator sends `bypass_zones` for it, which the web app offers after a warning. The bypassed zone is ignored when judging warm-up. Sensor 1 cannot be bypassed.
 

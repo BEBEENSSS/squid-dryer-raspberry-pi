@@ -55,6 +55,21 @@ ZONE_SENSOR_IDS = {
     "top": "28-0624c1511aba",
 }
 ZONE_ID_PATTERN = r"^28-[0-9a-f]{12}$"
+
+# ---------------- top sensor: DHT22 on GPIO22 (temperature + humidity) ----------------
+# Being tried out in sensor2_test.py only (dht22.py, calibration.py). The service does not read it yet: it still
+# goes by ZONE_SENSOR_IDS above, so nothing here changes what the dryer does. The DHT22 has no 1-Wire id; its
+# calibration entry is keyed by DHT22_ID instead.
+# GPIO22 must not also carry a 1-Wire bus: remove dtoverlay=w1-gpio,gpiopin=22 from /boot/firmware/config.txt
+# (the kernel driver owns the pin and a DHT22 read gets "device or resource busy").
+DHT22_PIN = 22
+DHT22_ID = f"dht22-gpio{DHT22_PIN}"
+GPIO_CHIP_PATH = "/dev/gpiochip0"  # the header pins on a Pi 4
+DHT22_MIN_INTERVAL_S = 2.0         # the sensor measures once per 2 s; asking sooner returns the previous reading
+DHT22_START_LOW_S = 0.002          # host start signal: data line held low (spec: at least 1 ms, at most 20 ms)
+DHT22_BIT_THRESHOLD_US = 50        # a data bit's high pulse is ~27 us for 0 and ~70 us for 1
+HUMIDITY_PLAUSIBLE_MIN = 0.0
+HUMIDITY_PLAUSIBLE_MAX = 100.0
 # Degrees a zone may sit below the shared band floor (target - TARGET_TOLERANCE_C) and still count as warm. The
 # thermostat sits on the bottom sensor, so the upper zones may lag it; raise these from measured runs
 # (the warmup_zone_reached events and the per-zone temperature log show the real gradient).
