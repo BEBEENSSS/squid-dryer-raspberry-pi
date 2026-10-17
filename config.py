@@ -38,28 +38,10 @@ CUTOFF_SHUTDOWN_GAP_C = 1.0     # ...and at least this far below the safe shutdo
 # "Approaching safe shutdown" is reported when the hottest sensor is within this of the safe shutdown temperature.
 SHUTDOWN_WARN_MARGIN_C = 2.0
 
-# ---------------- chamber zones: one DS18B20 per 1-Wire bus ----------------
-# bottom = sensor 1 (GPIO4, near the heater and fan), middle = sensor 2 (GPIO22), top = sensor 3 (GPIO23).
-# Sensor 1 alone holds the heater thermostat and the heater interlock, so it can never be bypassed and
-# never gets a calibration offset (it is the reference the others are matched to). The other two widen what
-# counts as "warm" (every zone has to be) and as "hot" (the hottest healthy one decides).
-ZONES = ("bottom", "middle", "top")  # bottom to top
-CONTROL_ZONE = "bottom"
-ZONE_SENSOR_IDS = {
-    "bottom": SENSOR_ID,
-    # Ids as listed by `python sensor2_test.py --expect 3`. The middle/top assignment follows the 1-Wire bus
-    # order (master1 = GPIO22, master2 = GPIO23) and has NOT been confirmed by warming one sensor by hand: if
-    # the dashboard's Middle row reacts when you warm the TOP sensor, swap these two lines and restart.
-    # (A placeholder or malformed id makes every task start be rejected, zones_unconfigured.)
-    "middle": "28-0624c12820aa",
-    "top": "28-0624c1511aba",
-}
-ZONE_ID_PATTERN = r"^28-[0-9a-f]{12}$"
-
 # ---------------- top sensor: DHT22 on GPIO22 (temperature + humidity) ----------------
-# Being tried out in sensor2_test.py only (dht22.py, calibration.py). The service does not read it yet: it still
-# goes by ZONE_SENSOR_IDS above, so nothing here changes what the dryer does. The DHT22 has no 1-Wire id; its
-# calibration entry is keyed by DHT22_ID instead.
+# The DHT22 has no 1-Wire id; ZONE_SENSOR_IDS below names it by DHT22_ID, which is also the key of its calibration
+# entry (calibration.py). It is the top zone: its temperature goes through the same Sensor / SensorArray as the
+# DS18B20s, and its humidity is published as state/humidity and recorded in temp_history.
 # GPIO22 must not also carry a 1-Wire bus: remove dtoverlay=w1-gpio,gpiopin=22 from /boot/firmware/config.txt
 # (the kernel driver owns the pin and a DHT22 read gets "device or resource busy").
 DHT22_PIN = 22
@@ -67,9 +49,37 @@ DHT22_ID = f"dht22-gpio{DHT22_PIN}"
 GPIO_CHIP_PATH = "/dev/gpiochip0"  # the header pins on a Pi 4
 DHT22_MIN_INTERVAL_S = 2.0         # the sensor measures once per 2 s; asking sooner returns the previous reading
 DHT22_START_LOW_S = 0.002          # host start signal: data line held low (spec: at least 1 ms, at most 20 ms)
+# Roughly 1 read in 8 still loses an edge on a Pi 4 (the checksum rejects it, never a wrong value). The sensor
+# answers a repeat request at once with its last measurement, so a failed read is simply asked again.
+DHT22_ATTEMPTS = 3
+DHT22_LOCK_PATH = DB_PATH.parent / "dht22.lock"  # readers of the pin take turns on this file (dht22.py)
+DHT22_RETRY_GAP_S = 0.5
 DHT22_BIT_THRESHOLD_US = 50        # a data bit's high pulse is ~27 us for 0 and ~70 us for 1
+# A DHT22 misses an occasional read (a timed single-wire protocol on a loaded Pi), unlike a DS18B20 with a CRC'd
+# scratchpad, so it gets a longer run of bad reads and a longer stale time before it counts as failed. A failed top
+# sensor fails a warm-up, so three misses in a row (SENSOR_BAD_LIMIT) would be too eager. The stale time has to
+# outlast the bad limit times the read interval (DHT22_MIN_INTERVAL_S).
+DHT22_BAD_LIMIT = 5
+DHT22_STALE_SECONDS = 15
 HUMIDITY_PLAUSIBLE_MIN = 0.0
 HUMIDITY_PLAUSIBLE_MAX = 100.0
+
+# ---------------- chamber zones: two DS18B20 and a DHT22 ----------------
+# bottom = sensor 1 (DS18B20, GPIO4, near the heater and fan), middle = DS18B20 on GPIO23, top = DHT22 on GPIO22.
+# Sensor 1 alone holds the heater thermostat and the heater interlock, so it can never be bypassed and
+# never gets a calibration offset (it is the reference the others are matched to). The other two widen what
+# counts as "warm" (every zone has to be) and as "hot" (the hottest healthy one decides).
+ZONES = ("bottom", "middle", "top")  # bottom to top
+CONTROL_ZONE = "bottom"
+HUMIDITY_ZONE = "top"                # the only zone with a humidity reading
+ZONE_SENSOR_IDS = {
+    "bottom": SENSOR_ID,
+    # The id as listed by `python sensor2_test.py --expect 3` once the GPIO22 overlay is gone: the only 28-... id
+    # besides sensor 1. (A placeholder or malformed id makes every task start be rejected, zones_unconfigured.)
+    "middle": "28-0624c1511aba",
+    "top": DHT22_ID,
+}
+ZONE_ID_PATTERN = r"^(28-[0-9a-f]{12}|dht22-gpio\d+)$"
 # Degrees a zone may sit below the shared band floor (target - TARGET_TOLERANCE_C) and still count as warm. The
 # thermostat sits on the bottom sensor, so the upper zones may lag it; raise these from measured runs
 # (the warmup_zone_reached events and the per-zone temperature log show the real gradient).
@@ -89,7 +99,7 @@ HEATER_MIN_RISE_C = 2.0
 # 5 C below the default maximum, which is where tasks always ran before the target was configurable.
 MANUAL_TARGET_TEMP_C = TEMP_MAX_C - TEMP_RESUME_DROP  # defaults, used until valid saved values exist
 MANUAL_HYSTERESIS_C = 2.0       # manual heater back on at target - hysteresis
-MANUAL_TARGET_HUMIDITY = 60.0   # stored and reported only, there is no humidity sensor
+MANUAL_TARGET_HUMIDITY = 60.0   # stored and reported; humidity is measured at the top (DHT22) but not controlled
 MANUAL_TARGET_HUMIDITY_MIN = 20.0
 MANUAL_TARGET_HUMIDITY_MAX = 80.0
 
@@ -172,6 +182,9 @@ TEMP_HISTORY_INTERVAL_SECONDS = 30  # how often the sensors are sampled, not how
 # A sample is recorded only if some sensor moved at least this far from its own value in the previous record
 # (or a sensor started or stopped reading). The same limit applies to bottom, middle and top. 0 records every sample.
 TEMP_HISTORY_MIN_CHANGE_C = 1.0
+# The humidity (%RH, DHT22 at the top) is judged the same way against its own value in the previous record, with its
+# own limit: about the sensor's accuracy, so noise does not fill the history.
+TEMP_HISTORY_MIN_CHANGE_RH = 2.0
 # Newest records kept in Firebase, trimmed only when new ones arrive. Records are written only on change, so this
 # spans far more than 48 h unless the chamber is changing all the time.
 TEMP_HISTORY_RETENTION = 5760

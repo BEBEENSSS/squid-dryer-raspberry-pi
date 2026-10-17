@@ -11,12 +11,11 @@ SIMULATE = os.environ.get("SIMULATE") == "1"
 if SIMULATE:
     os.environ.setdefault("GPIOZERO_PIN_FACTORY", "mock")
 
-import calibration  # noqa: E402
 import config  # noqa: E402
 import sd_notify  # noqa: E402
 from cloud_sync import CloudSync, firebase_base  # noqa: E402
 from command_age import LocalCommandMark  # noqa: E402
-from hardware import Outputs, Sensor, SensorArray, make_reader  # noqa: E402
+from hardware import Outputs, Sensor, SensorArray, make_zone_sensor  # noqa: E402
 from link_monitor import LinkMonitor  # noqa: E402
 from local_api import LocalApi  # noqa: E402
 from machine_settings import shutdown_warning  # noqa: E402
@@ -210,21 +209,27 @@ def main():
 
     out = Outputs()  # both relays off before anything else happens
     oven = None
-    offsets = {}  # calibration applied to each sensor, for the start-up event
+    offsets = {}  # temperature calibration applied to each sensor, for the start-up event
+    offsets_rh = {}  # humidity calibration, only for a sensor that measures humidity
     if SIMULATE:
         from sim import SimOven
         oven = SimOven()
         oven.heater = out.heater
+        # the top sensor behaves like the DHT22: temperature and humidity from one read, longer bad/stale limits
         zones = SensorArray({"bottom": Sensor(oven.read),
                              "middle": Sensor(lambda: oven.read_zone("middle")),
-                             "top": Sensor(lambda: oven.read_zone("top"))})
+                             "top": Sensor(lambda: oven.read_zone_humidity("top"),
+                                           bad_limit=config.DHT22_BAD_LIMIT,
+                                           stale_seconds=config.DHT22_STALE_SECONDS)})
         print("SIMULATE=1: mock relays and a simulated chamber, no hardware is touched")
     else:
         sensors = {}
         for zone in config.ZONES:
             sensor_id = config.ZONE_SENSOR_IDS[zone]
-            offsets[zone] = calibration.zone_offset(sensor_id)  # always 0 for sensor 1, the reference
-            sensors[zone] = Sensor(make_reader(sensor_id, offsets[zone]))
+            # the offset is always 0 for sensor 1, the reference
+            sensors[zone], offsets[zone], offset_rh = make_zone_sensor(sensor_id)
+            if sensor_id == config.DHT22_ID:
+                offsets_rh[zone] = offset_rh
         zones = SensorArray(sensors, ids=config.ZONE_SENSOR_IDS)
     sensor = zones.control  # sensor 1 alone holds the thermostat and the heater interlock
     out.attach_sensor(sensor)
@@ -349,19 +354,22 @@ def main():
     store.log_event("device_started", "device started", data={
         "boot_changed": prev_boot != boot_id, "previous_boot_id": prev_boot,
         "clean_shutdown": clean, "clock_synced": clock_synced(),
-        "sensor_offsets_c": offsets, "zones_unconfigured": zones.unconfigured(),
+        "sensor_offsets_c": offsets, "sensor_offsets_rh": offsets_rh, "zones_unconfigured": zones.unconfigured(),
     })
     tm.startup(prev_boot, clean)
 
-    def read_sensor(s):
+    def read_sensor(s, interval):
         # the 1-Wire read takes about a second, so it must not hold up command handling. One thread per
         # sensor: read one after another the three would take sensor 1 past DWELL_MAX_GAP_SECONDS, and a
         # slow or dead upper sensor must never delay the one that holds the heater thermostat.
-        while not stop.wait(config.SENSOR_INTERVAL):
+        while not stop.wait(interval):
             s.poll()
 
     for zone, s in zones.sensors.items():
-        threading.Thread(target=read_sensor, args=(s,), daemon=True, name=f"sensor-{zone}").start()
+        # the DHT22 measures once per 2 s: asking sooner just returns the previous reading again
+        interval = max(config.SENSOR_INTERVAL, config.DHT22_MIN_INTERVAL_S) if zone == config.HUMIDITY_ZONE \
+            else config.SENSOR_INTERVAL
+        threading.Thread(target=read_sensor, args=(s, interval), daemon=True, name=f"sensor-{zone}").start()
     threading.Thread(target=sync.run, args=(stop,), daemon=True, name="cloud-sync").start()
     threading.Thread(target=recorder.run, args=(stop,), daemon=True, name="temp-recorder").start()
     threading.Thread(target=uploader.run, args=(stop,), daemon=True, name="temp-uploader").start()

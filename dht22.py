@@ -12,7 +12,10 @@ The pin must be free: a `dtoverlay=w1-gpio` line for the same pin makes the kern
 as busy. The sensor measures once per 2 s, so read no faster than that (config.DHT22_MIN_INTERVAL_S).
 """
 
+import fcntl
+import os
 import time
+from contextlib import contextmanager
 from typing import NamedTuple
 
 import gpiod
@@ -26,6 +29,28 @@ EVENT_BUFFER = 256    # the reply is ~85 edges; the kernel holds them until they
 RECORD_SECONDS = 0.02  # the whole reply takes ~5 ms
 MIN_PULSE_US = 5      # a high pulse shorter or longer than any real bit is noise, not a reading
 MAX_PULSE_US = 150
+# Switching the pin to an input and arming edge detection takes the kernel ~200-400 us, and the sensor has
+# already started its reply by then, so on a Pi 4 roughly every other read loses the first bit or two (measured:
+# 38-39 pulses instead of 40). Those are the top bits of the humidity value, which is at most 1000 (0x03E8): its
+# top 6 bits are always 0, so a lost leading bit is known and is put back. The checksum still has to match.
+MAX_LOST_LEADING_BITS = 6
+
+
+LOCK_PATH = config.DHT22_LOCK_PATH
+
+
+@contextmanager
+def _one_reader_at_a_time():
+    """The dryer service and sensor2_test.py both read this pin and the kernel hands it to one request at a time,
+    so a second reader would fail as 'busy'. They queue on a lock file instead (the kernel drops it when a
+    process dies, so a crashed reader cannot block the others). A read holds it for ~25 ms."""
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o666)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # closing the descriptor releases the lock
 
 
 class Reading(NamedTuple):
@@ -59,7 +84,8 @@ def bytes_from_edges(edges):
     """Edge list [(timestamp_ns, rising)] to the five reply bytes. Raises ValueError with the reason.
 
     A bit is the width of one high pulse. The reply starts with a high pulse that is not a bit (the sensor's
-    acknowledge) and the line's own release can add another, so only the last 40 high pulses count.
+    acknowledge) and the line's own release can add another, so only the last 40 high pulses count. Up to
+    MAX_LOST_LEADING_BITS missing at the front are zeros (see above).
     """
     widths_us = []
     risen_at = None
@@ -71,13 +97,13 @@ def bytes_from_edges(edges):
             risen_at = None
     if not widths_us:
         raise ValueError("no response (check the wiring, the pull-up and that the data wire is on this pin)")
-    if len(widths_us) < DATA_BITS:
+    if len(widths_us) < DATA_BITS - MAX_LOST_LEADING_BITS:
         raise ValueError(f"reply cut short: {len(widths_us)} pulses, need {DATA_BITS}")
 
     bits = widths_us[-DATA_BITS:]
     if not all(MIN_PULSE_US <= w <= MAX_PULSE_US for w in bits):
         raise ValueError("pulse timing out of range (noisy line or a loaded system)")
-    value = 0
+    value = 0  # a bit lost at the front simply is not shifted in: it stays 0
     for width in bits:
         value = (value << 1) | (1 if width > config.DHT22_BIT_THRESHOLD_US else 0)
     return list(value.to_bytes(5, "big"))
@@ -104,23 +130,32 @@ def _record(pin, chip_path, request_lines, sleep):
         request.release()
 
 
-def read(pin=None, chip_path=None, request_lines=gpiod.request_lines, sleep=time.sleep):
-    """One reading. Never raises for a bad read: temp_c and humidity are None and error says why."""
+def read(pin=None, chip_path=None, request_lines=gpiod.request_lines, sleep=time.sleep, attempts=None):
+    """One reading, asked again after a bad one (see DHT22_ATTEMPTS). Never raises for a bad read: temp_c and
+    humidity are None and error says why. A pin that cannot be used at all is reported at once, not retried."""
     pin = config.DHT22_PIN if pin is None else pin
     chip_path = chip_path or config.GPIO_CHIP_PATH
-    try:
-        edges = _record(pin, chip_path, request_lines, sleep)
-    except PermissionError:
-        return _bad(f"no permission on {chip_path} (the user needs to be in the gpio group)")
-    except FileNotFoundError:
-        return _bad(f"{chip_path} does not exist")
-    except OSError as e:
-        if e.errno == 16:  # EBUSY
-            return _bad(f"GPIO{pin} is busy: another driver owns it. Remove dtoverlay=w1-gpio,gpiopin={pin} "
-                        "from /boot/firmware/config.txt and reboot")
-        return _bad(f"GPIO{pin} cannot be used ({e.strerror or e})")
-    try:
-        temp, humidity = decode(bytes_from_edges(edges))
-    except ValueError as e:
-        return _bad(str(e))
-    return Reading(temp, humidity, None)
+    attempts = config.DHT22_ATTEMPTS if attempts is None else attempts
+    reason = None
+    for attempt in range(attempts):
+        if attempt:
+            sleep(config.DHT22_RETRY_GAP_S)
+        try:
+            with _one_reader_at_a_time():
+                edges = _record(pin, chip_path, request_lines, sleep)
+        except PermissionError:
+            return _bad(f"no permission on {chip_path} (the user needs to be in the gpio group)")
+        except FileNotFoundError:
+            return _bad(f"{chip_path} does not exist")
+        except OSError as e:
+            if e.errno == 16:  # EBUSY
+                return _bad(f"GPIO{pin} is busy: another driver owns it. Remove dtoverlay=w1-gpio,gpiopin={pin} "
+                            "from /boot/firmware/config.txt and reboot")
+            return _bad(f"GPIO{pin} cannot be used ({e.strerror or e})")
+        try:
+            temp, humidity = decode(bytes_from_edges(edges))
+        except ValueError as e:
+            reason = str(e)
+            continue
+        return Reading(temp, humidity, None)
+    return _bad(reason if attempts == 1 else f"{reason} ({attempts} tries)")

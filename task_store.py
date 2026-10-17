@@ -6,7 +6,7 @@ import threading
 import time
 from pathlib import Path
 
-from temp_history import SENSORS, placed_ms, record_key
+from temp_history import HUMIDITY, SENSORS, placed_ms, record_key
 
 # statuses that mean a task still owns the machine
 ACTIVE_STATUSES = ("starting", "warming_up", "running", "recovering", "recovery_required")
@@ -122,6 +122,7 @@ CREATE TABLE IF NOT EXISTS temp_history (
     bottom REAL,
     middle REAL,
     top REAL,
+    humidity REAL,            -- %RH of the top sensor (DHT22) in the same read; NULL when it had no valid reading
     gap INTEGER NOT NULL DEFAULT 0,     -- 1: not a continuation of the record before it (first since a start, or after every sensor failed)
     synced INTEGER NOT NULL DEFAULT 0   -- 1 once Firebase has confirmed the record
 );
@@ -180,6 +181,9 @@ class TaskStore:
             # databases created before records were written only on change: every row so far continues the last
             if "gap" not in [r["name"] for r in c.execute("PRAGMA table_info(temp_history)")]:
                 c.execute("ALTER TABLE temp_history ADD COLUMN gap INTEGER NOT NULL DEFAULT 0")
+            # databases created before the top sensor measured humidity: those records simply have none
+            if "humidity" not in [r["name"] for r in c.execute("PRAGMA table_info(temp_history)")]:
+                c.execute("ALTER TABLE temp_history ADD COLUMN humidity REAL")
 
     @staticmethod
     def _ensure_temp_minutes(c):
@@ -407,7 +411,7 @@ class TaskStore:
         return t_ms
 
     def add_temp_reading(self, readings, mono, gap=False):
-        """Store one reading per sensor ({zone: °C}, only zones that have one). Returns the row id.
+        """Store one reading per sensor ({zone: °C, "humidity": %RH}, only what has one). Returns the row id.
 
         `gap` marks a record that does not continue the one before it, so a chart breaks the line there.
         With a synced clock the record gets its time and id at once. Otherwise it waits, with its monotonic
@@ -417,10 +421,10 @@ class TaskStore:
         with self._conn() as c:
             t_ms = self._free_t(c, int(round(wall * 1000))) if synced else None
             cur = c.execute(
-                "INSERT INTO temp_history(rid, boot_id, mono, wall, clock_synced, t_ms, bottom, middle, top, gap) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO temp_history(rid, boot_id, mono, wall, clock_synced, t_ms, bottom, middle, top, humidity, gap) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (record_key(t_ms) if synced else None, self.boot_id, mono, wall, int(synced), t_ms,
-                 *(readings.get(zone) for zone in SENSORS), int(bool(gap))))
+                 *(readings.get(zone) for zone in SENSORS), readings.get(HUMIDITY), int(bool(gap))))
             return cur.lastrowid
 
     def place_temp_history(self, mono_now):
@@ -464,11 +468,11 @@ class TaskStore:
         newest one from before `since_ms`: the value the chart holds from the left edge of the window.
         """
         rows = [dict(r) for r in self._conn().execute(
-            "SELECT rid, t_ms, bottom, middle, top, gap FROM temp_history WHERE t_ms IS NOT NULL AND t_ms>=? "
+            "SELECT rid, t_ms, bottom, middle, top, humidity, gap FROM temp_history WHERE t_ms IS NOT NULL AND t_ms>=? "
             "ORDER BY t_ms LIMIT ?", (since_ms, limit))]
         if carry:
             before = self._conn().execute(
-                "SELECT rid, t_ms, bottom, middle, top, gap FROM temp_history WHERE t_ms IS NOT NULL AND t_ms<? "
+                "SELECT rid, t_ms, bottom, middle, top, humidity, gap FROM temp_history WHERE t_ms IS NOT NULL AND t_ms<? "
                 "ORDER BY t_ms DESC LIMIT 1", (since_ms,)).fetchone()
             if before is not None:
                 rows.insert(0, dict(before))

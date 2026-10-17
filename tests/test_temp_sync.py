@@ -33,13 +33,17 @@ def make_cfg(**over):
 
 
 class Zones:
-    """Stands in for SensorArray.temps(): a sensor with no healthy reading is None."""
+    """Stands in for SensorArray.temps() and .humidity(): a sensor with no healthy reading is None."""
 
     def __init__(self):
         self.values = {"bottom": 30.0, "middle": 29.0, "top": 28.0}
+        self.humidity_value = None  # the DHT22's %RH; most tests are about temperatures and leave it out
 
     def temps(self):
         return dict(self.values)
+
+    def humidity(self):
+        return self.humidity_value
 
 
 class SpyBase(FakeBase):
@@ -552,7 +556,7 @@ def test_a_failing_firebase_with_internet_up_leaves_the_drying_task_alone(rig):
     sync = CloudSync(lambda: rig.store, rig.tm, status, queue.Queue(), rig.boot_id, base_factory=lambda: base,
                      mono=lambda: clock.mono, link=link)
     pending = Gauge()
-    zones = SimpleNamespace(temps=lambda: {"bottom": rig.sensor.temp()})
+    zones = SimpleNamespace(temps=lambda: {"bottom": rig.sensor.temp()}, humidity=lambda: None)
     uploader = TempUploader(lambda: rig.store, lambda: base, link, pending, cfg=cfg, mono=lambda: clock.mono,
                             rand=lambda: 0.5)
     recorder = TempRecorder(lambda: rig.store, zones, lambda: clock.synced, pending, cfg=cfg,

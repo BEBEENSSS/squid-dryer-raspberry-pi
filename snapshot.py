@@ -20,16 +20,20 @@ def ack_payload(ack):
 def zone_state(zones):
     """The state/* keys for the middle and top sensors. `temp` and `sensor_ok` stay the bottom sensor's.
 
-    A temperature is None (the key is removed) while its sensor is unhealthy, like `temp` itself.
+    A temperature is None (the key is removed) while its sensor is unhealthy, like `temp` itself. `humidity` is
+    the top sensor's (the DHT22) and goes the same way.
     """
     temps = zones.temps()
 
     def one(zone):
         return round(temps[zone], 1) if temps.get(zone) is not None else None
 
+    humidity = zones.humidity()  # the top sensor's, in %RH; None (key removed) while it is unhealthy
+
     return {
         "temp_middle": one("middle"),
         "temp_top": one("top"),
+        "humidity": round(humidity, 1) if humidity is not None else None,
         "sensor_middle_ok": zones.healthy("middle"),
         "sensor_top_ok": zones.healthy("top"),
         "zones_configured": zones.configured(),  # False while the ids in config.py are placeholders

@@ -1,8 +1,8 @@
 """Rolling temperature history: sample every sensor on a timer, record a sample only when it changed, keep what
 Firebase has not confirmed, send it later.
 
-    TempRecorder   its own thread. Reads the three sensors, writes a row to SQLite when one moved. Never touches
-                   the network.
+    TempRecorder   its own thread. Reads the three sensors (and the top one's humidity), writes a row to SQLite
+                   when one moved. Never touches the network.
     TempUploader   its own thread. Sends pending rows to Firebase oldest first and marks one delivered only
                    after Firebase has answered. Failures leave the rows where they are and back off.
 
@@ -15,7 +15,7 @@ import threading
 import time
 
 import config
-from temp_history import RemoteWindow, backoff_delay, clean_readings, payload, worth_recording
+from temp_history import SENSORS, RemoteWindow, backoff_delay, clean_readings, payload, worth_recording
 
 START_DELAY_SECONDS = 3  # lets the sensor threads take their first reading before the first record
 
@@ -55,11 +55,14 @@ class TempRecorder:
         if self._unplaced and self.clock_synced():
             store.place_temp_history(self.mono())
             self._unplaced = False
-        readings = clean_readings(self.zones.temps())  # None for a stale or failed sensor, so it is left out
-        if not readings:
+        # None for a stale or failed sensor, so it is left out; the humidity rides along with the top sensor's read
+        readings = clean_readings(self.zones.temps(), self.zones.humidity())
+        if not any(zone in readings for zone in SENSORS):
+            # humidity alone is not a record: with no temperature there is nothing to continue
             self._last = None  # whatever is measured next does not continue what came before
             return None
-        if not worth_recording(self._last, readings, self.cfg.TEMP_HISTORY_MIN_CHANGE_C):
+        if not worth_recording(self._last, readings, self.cfg.TEMP_HISTORY_MIN_CHANGE_C,
+                               self.cfg.TEMP_HISTORY_MIN_CHANGE_RH):
             return None
         if not self.clock_synced():
             self._unplaced = True

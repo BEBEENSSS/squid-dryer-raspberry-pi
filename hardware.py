@@ -5,6 +5,7 @@ from pathlib import Path
 
 from gpiozero import OutputDevice
 
+import calibration
 import config
 from heater_guard import HeaterGuard
 
@@ -38,25 +39,38 @@ def read_temp(sensor_dir=None):
 
 
 class Sensor:
-    """Tracks the last valid reading and whether the sensor counts as healthy."""
+    """Tracks the last valid reading and whether the sensor counts as healthy.
 
-    def __init__(self, read_fn=read_temp, clock=time.monotonic):
+    `read_fn` returns a temperature in C, a `(temp_c, humidity_pct)` pair from a sensor that measures both (the
+    DHT22), or None for a bad read. The humidity belongs to the same read as the temperature, so one bad read
+    voids both and the sensor's health covers both.
+    """
+
+    def __init__(self, read_fn=read_temp, clock=time.monotonic,
+                 bad_limit=config.SENSOR_BAD_LIMIT, stale_seconds=config.SENSOR_STALE_SECONDS):
         self._read = read_fn
         self._clock = clock
+        self._bad_limit = bad_limit
+        self._stale_seconds = stale_seconds
         self._lock = threading.Lock()
         self.temp_c = None      # last valid temperature
+        self.humidity_pct = None  # humidity of that same read, None for a sensor that has none
         self.temp_time = 0.0    # monotonic time of last valid read
         self.bad_reads = 0      # consecutive bad reads
         self.reads = 0          # valid reads so far, lets callers spot new readings
 
     def poll(self):
         value = self._read()
+        humidity = None
+        if isinstance(value, tuple):
+            value, humidity = value
         with self._lock:
             if value is None:
                 self.bad_reads += 1
             else:
                 self.bad_reads = 0
                 self.temp_c = value
+                self.humidity_pct = humidity
                 self.temp_time = self._clock()
                 self.reads += 1
         return value
@@ -65,13 +79,17 @@ class Sensor:
         with self._lock:
             return (
                 self.temp_c is not None
-                and self.bad_reads < config.SENSOR_BAD_LIMIT
-                and self._clock() - self.temp_time <= config.SENSOR_STALE_SECONDS
+                and self.bad_reads < self._bad_limit
+                and self._clock() - self.temp_time <= self._stale_seconds
             )
 
     def temp(self):
         """Last valid temperature if the sensor is healthy, else None."""
         return self.temp_c if self.ok() else None
+
+    def humidity(self):
+        """Last valid humidity in %RH if the sensor is healthy, else None (also for a sensor without one)."""
+        return self.humidity_pct if self.ok() else None
 
 
 def make_reader(sensor_id, offset_c=0.0, base=None):
@@ -83,6 +101,47 @@ def make_reader(sensor_id, offset_c=0.0, base=None):
         return None if value is None else round(value + offset_c, 3)
 
     return read
+
+
+def make_dht_reader(pin=None, offset_c=0.0, offset_rh=0.0, read_fn=None):
+    """Read function for the DHT22: a `(temp_c, humidity_pct)` pair with the calibration offsets applied, None for a
+    bad read. The driver (and its gpiod dependency) is imported on first use, so a PC without it can still run the
+    simulation and the tests. `read_fn` replaces dht22.read in tests."""
+
+    warned = []
+
+    def read():
+        reader = read_fn
+        if reader is None:
+            try:
+                import dht22
+            except ImportError as e:  # gpiod missing: the sensor reads as failed, and the log says why (once)
+                if not warned:
+                    warned.append(True)
+                    print(f"DHT22 driver unavailable: {e} (pip install -r requirements.txt)")
+                return None
+            reader = dht22.read
+        reading = reader(pin) if pin is not None else reader()
+        if reading.error is not None or reading.temp_c is None or reading.humidity is None:
+            return None
+        return round(reading.temp_c + offset_c, 3), calibration.corrected_humidity(reading.humidity, offset_rh)
+
+    return read
+
+
+def make_zone_sensor(sensor_id, cfg=config):
+    """A Sensor for one configured zone id, with its saved calibration: `(sensor, offset_c, offset_rh)`.
+
+    A 1-Wire id is a DS18B20 read from /sys, the DHT22's id reads temperature and humidity from its GPIO pin. The
+    offset is always 0 for sensor 1, the reference the others are matched to.
+    """
+    offset_c = calibration.zone_offset(sensor_id)
+    if sensor_id == cfg.DHT22_ID:
+        offset_rh = calibration.load_humidity_offset(sensor_id)
+        sensor = Sensor(make_dht_reader(cfg.DHT22_PIN, offset_c, offset_rh),
+                        bad_limit=cfg.DHT22_BAD_LIMIT, stale_seconds=cfg.DHT22_STALE_SECONDS)
+        return sensor, offset_c, offset_rh
+    return Sensor(make_reader(sensor_id, offset_c)), offset_c, 0.0
 
 
 def unconfigured_zones(ids, cfg=config):
@@ -126,6 +185,11 @@ class SensorArray:
     def temps(self):
         """Healthy reading per zone, None for a zone that is not healthy."""
         return {zone: self.sensors[zone].temp() for zone in self.zones}
+
+    def humidity(self):
+        """Humidity in %RH from the zone that has a sensor for it, None while that sensor is unhealthy or absent."""
+        sensor = self.sensors.get(self._cfg.HUMIDITY_ZONE)
+        return sensor.humidity() if sensor is not None else None
 
     def unconfigured(self):
         return [] if self._ids is None else unconfigured_zones(self._ids, self._cfg)

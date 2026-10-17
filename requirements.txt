@@ -1,2 +1,3 @@
 gpiozero
 firebase-admin
+gpiod>=2

@@ -172,7 +172,8 @@ def test_state_carries_the_upper_temperatures_and_their_health(zrig):
     zrig.run(4)
     state = zone_state(zrig.zones)
     assert state == {"temp_middle": zrig.oven.read_zone("middle"), "temp_top": zrig.oven.read_zone("top"),
-                     "sensor_middle_ok": True, "sensor_top_ok": True, "zones_configured": True}
+                     "sensor_middle_ok": True, "sensor_top_ok": True, "zones_configured": True,
+                     "humidity": None}   # the test rig's sensors are plain thermometers: no humidity, key removed
     zrig.oven.zone_broken.add("top")
     zrig.run(10)
     state = zone_state(zrig.zones)

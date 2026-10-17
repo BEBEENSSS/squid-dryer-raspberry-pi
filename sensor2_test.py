@@ -3,8 +3,8 @@
 The extra sensors are every 1-Wire thermometer that is not config.SENSOR_ID (sensor 1, the main sensor on
 GPIO4) and the DHT22 on config.DHT22_PIN (GPIO22), the top sensor, which also reads humidity. They are read next
 to sensor 1 and printed in one table. Sensor 1 is the reference for every comparison and for calibration.
-It only reads /sys and the DHT22's pin, never touches the relays, so it is safe to run while
-squid-dryer.service is running. The service does not read the DHT22 yet.
+It only reads /sys and the DHT22's pin, never touches the relays. The service reads the DHT22 too, and GPIO22
+carries only one reader at a time, so stop squid-dryer.service while testing the DHT22 (or pass --no-dht).
 
     python sensor2_test.py                   # test every extra sensor, Ctrl+C to stop
     python sensor2_test.py --expect 3        # fail loudly unless 3 sensors in total (main + 2) show up
@@ -121,13 +121,13 @@ def no_sensor_help(base, found):
         buses = sorted(p.name for p in base.glob("w1_bus_master*"))
         print("Only the main sensor is showing up, the extra ones are not.")
         if len(buses) < 2:
-            print("Only one 1-Wire bus is active (GPIO4, the main sensor). For an extra 1-Wire sensor on its own pin, add")
+            print("Only one 1-Wire bus is active (GPIO4, the main sensor). For the middle sensor on its own pin, add")
             print("  dtoverlay=w1-gpio,gpiopin=23")
             print("to /boot/firmware/config.txt and reboot, then wire its data to GPIO23 (physical pin 16).")
             print(f"GPIO{config.DHT22_PIN} is the DHT22's: it must not have a 1-Wire overlay.")
         else:
             print(f"A second bus is up ({', '.join(buses)}) but no sensor answers on it.")
-            print("Check the wiring: red to 3V3, black to GND, yellow/data to its own GPIO (23 for the middle sensor),")
+            print("Check the wiring: red to 3V3, black to GND, yellow/data to GPIO23 (the middle sensor),")
             print("with a 4.7k pull-up from each data wire to 3V3.")
 
 

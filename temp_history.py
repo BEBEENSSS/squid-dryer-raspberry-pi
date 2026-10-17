@@ -12,7 +12,8 @@ The web app (src/lib/temp-history.ts) applies the same rule to its live readings
 import math
 import random
 
-SENSORS = ("bottom", "middle", "top")  # bottom = sensor 1 (GPIO4), middle = sensor 2 (GPIO22), top = sensor 3 (GPIO23)
+SENSORS = ("bottom", "middle", "top")  # bottom = DS18B20 (GPIO4), middle = DS18B20 (GPIO23), top = DHT22 (GPIO22)
+HUMIDITY = "humidity"                  # %RH from the top sensor; kept next to the temperatures in a record
 # Not a tunable: the web app builds the same keys (src/lib/temp-history.ts), so the width is part of the contract.
 KEY_DIGITS = 13
 
@@ -25,29 +26,37 @@ def _number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
-def clean_readings(temps):
-    """{zone: °C or None} -> only the zones that have a real reading. A missing sensor is left out, never 0."""
-    return {zone: float(temps[zone]) for zone in SENSORS if _number(temps.get(zone))}
+def clean_readings(temps, humidity=None):
+    """{zone: °C or None} (and the humidity in %RH) -> only what has a real reading. A missing sensor is left out,
+    never 0. A humidity outside 0-100 is a failed read, not a reading."""
+    out = {zone: float(temps[zone]) for zone in SENSORS if _number(temps.get(zone))}
+    if _number(humidity) and 0.0 <= humidity <= 100.0:
+        out[HUMIDITY] = float(humidity)
+    return out
 
 
-def worth_recording(last, readings, min_change):
-    """Whether `readings` ({zone: °C}) earn a new record after the previous one, which held `last`.
+def worth_recording(last, readings, min_change, min_change_rh=None):
+    """Whether `readings` ({zone: °C, "humidity": %RH}) earn a new record after the previous one, which held `last`.
 
-    Every sensor is judged by the same limit against its own value in that record: one moving `min_change` or
-    more is enough, and a sensor that started or stopped reading counts as a change too (a fault must show). With
-    no previous record to continue (`last` is None) the answer is always yes.
+    Every sensor is judged against its own value in that record: a temperature by `min_change` (the same limit for
+    all three), the humidity by `min_change_rh` (`min_change` when not given). One moving that far is enough, and a
+    sensor that started or stopped reading counts as a change too (a fault must show). With no previous record to
+    continue (`last` is None) the answer is always yes.
     """
     if last is None or readings.keys() != last.keys():
         return True
-    return any(abs(readings[zone] - last[zone]) >= min_change - 1e-9 for zone in readings)
+    limits = {key: (min_change if min_change_rh is None or key != HUMIDITY else min_change_rh) for key in readings}
+    return any(abs(readings[key] - last[key]) >= limits[key] - 1e-9 for key in readings)
 
 
 def payload(row):
-    """The Firebase record for a local row (a dict with t_ms, the three sensor columns and optionally gap)."""
+    """The Firebase record for a local row (a dict with t_ms, the sensor columns, humidity and optionally gap)."""
     out = {"t": int(row["t_ms"])}
     for zone in SENSORS:
         if _number(row.get(zone)):
             out[zone] = round(float(row[zone]), 2)
+    if _number(row.get(HUMIDITY)):
+        out[HUMIDITY] = round(float(row[HUMIDITY]), 1)
     if row.get("gap"):
         out["gap"] = True
     return out
