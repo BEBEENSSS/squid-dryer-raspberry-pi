@@ -113,14 +113,15 @@ HEATER_CUTOFF_MAX_C = TEMP_MAX_MAX_C - CUTOFF_SHUTDOWN_GAP_C            # 59
 HEATER_CUTOFF_MARGIN_C = 3.0    # recovery margin, prevents rapid switching around the limit
 
 # ---------------- drying tasks ----------------
-# A task's target and maximum are the saved settings (machine_settings.py), copied into the task when it starts.
+# A task's target is the saved setting (machine_settings.py): copied in when it starts and followed whenever the
+# operator saves a new one. Its maximum is copied at start (a raise waits for the next task).
 TASK_HYSTERESIS_C = 2.0         # heater back on at target - hysteresis
 CHECKPOINT_SECONDS = 10         # how often running-task progress is saved to disk
 
 # ---------------- warm-up before drying ----------------
 # A task starts WARMING_UP and only becomes drying (status "running") once the smoothed chamber
-# temperature has held the target band for the dwell. Every value here is copied into the task
-# when it starts, so editing this file never changes a session that is already running.
+# temperature has held the target band for the dwell. Every value here (the target aside, which is the saved
+# setting) is copied into the task when it starts, so editing this file never changes a session already running.
 # sample_interval and sensor_fail_limit are SENSOR_INTERVAL and SENSOR_BAD_LIMIT, set with the sensor.
 MEDIAN_WINDOW = 5               # moving-median window, in samples
 # Wider than TASK_HYSTERESIS_C: the thermostat lets the chamber sag by the hysteresis on every

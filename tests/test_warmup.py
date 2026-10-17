@@ -111,3 +111,17 @@ def test_a_short_dip_does_not_warn():
     dips = warmup.DipTracker(FLOOR, limit_s=600)
     dips.feed(0.0, 50.0)
     assert dips.feed(60.0, 54.0)[4] is False
+
+
+def test_a_raised_target_gets_a_settling_grace_that_ends_in_band_or_at_the_deadline():
+    # the chamber is below the new floor only because it has not heated up yet: not an excursion
+    dips = warmup.DipTracker(FLOOR, limit_s=600, settle_until=500.0)
+    assert dips.feed(0.0, 40.0) == (None, None, None, None, False)
+    assert dips.feed(300.0, 45.0)[0] is None and not dips.open
+    assert dips.feed(350.0, 53.0)[0] is None              # reached the band: the grace is over
+    assert dips.settle_until is None
+    assert dips.feed(360.0, 50.0)[0] == "opened"          # a later drop is a real dip
+
+    stuck = warmup.DipTracker(FLOOR, limit_s=600, settle_until=500.0)
+    assert stuck.feed(499.0, 44.0)[0] is None
+    assert stuck.feed(500.0, 44.0)[0] == "opened"          # never got there: the dip is reported

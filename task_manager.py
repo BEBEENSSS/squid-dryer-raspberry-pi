@@ -95,8 +95,9 @@ def _detail(diag):
 def session_snapshot(cfg, settings):
     """Everything a session runs with, frozen at start so later config edits cannot change it.
 
-    The target and the maximum are the saved settings of the moment. A later target or a raised maximum
-    waits for the next task; a lowered maximum still applies at once (`TaskManager.task_limit`).
+    The target and the maximum are the saved settings of the moment. A later target is followed by the
+    running task (`TaskManager._retarget`); a raised maximum waits for the next task and a lowered one
+    still applies at once (`TaskManager.task_limit`). Tolerance, dwell and the rest never change.
     """
     target, tolerance = float(settings.get(TARGET_KEY)), float(cfg.TARGET_TOLERANCE_C)
     allowance = getattr(cfg, "ZONE_FLOOR_ALLOWANCE_C", {})
@@ -112,6 +113,21 @@ def session_snapshot(cfg, settings):
         # each upper zone's own floor: the shared band floor, lowered by what that zone is allowed to lag
         **{col: target - tolerance - float(allowance.get(zone, 0.0)) for zone, col in ZONE_FLOOR_COLUMNS.items()},
     }
+
+
+def retarget_fields(task, new_target):
+    """The task columns that move when the operator saves a new target mid-task.
+
+    Only the target and the zone floors that hang off it. Tolerance, dwell, hysteresis, the warm-up timeout
+    and the safe shutdown stay as the session started. A zone's floor is `target - tolerance - allowance`, so
+    keeping its distance below the target keeps its allowance; a zone without a floor stays without one."""
+    old = float(task["target_c"])
+    fields = {"target_c": float(new_target)}
+    for col in ZONE_FLOOR_COLUMNS.values():
+        floor = task.get(col)
+        if floor is not None:
+            fields[col] = float(new_target) - (old - float(floor))
+    return fields
 
 
 def snapshot_valid(task):
@@ -442,7 +458,46 @@ class TaskManager:
 
     def apply_settings(self, payload):
         with self.lock:
-            return self.settings.apply(payload)
+            changed = self.settings.apply(payload)
+            if TARGET_KEY in changed and self.task is not None:
+                self._retarget()
+            return changed
+
+    def _retarget(self):
+        """The saved target is the one target there is: a running task follows it at once.
+
+        Warm-up starts its hold over against the new floors. While drying, an open dip below the old band is
+        closed, and a raise gets a grace (`DipTracker.settle_until`) so heating up to it is not logged as a dip.
+        The thermostat reads `target_c` on every tick, so it needs nothing here."""
+        t = self.task
+        new, old = self.settings.get(TARGET_KEY), t["target_c"]
+        if not _number(old) or new == old:
+            return
+        if new + float(self.cfg.TEMP_MAX_GAP_C) > self.task_limit(t):
+            # only when the saved shutdown was raised after this task started: the task keeps the limit it
+            # started with, so a target that close to it would let normal overshoot trip it
+            self.store.log_event("task_target_kept", "new target is too close to this task's safe shutdown "
+                                 "temperature, the task keeps its own", t["task_id"],
+                                 {"target_c": old, "requested_c": new, "temp_max_c": self.task_limit(t)})
+            return
+        status = t["status"]
+        self.task = self.store.update_task(
+            t["task_id"], **retarget_fields(t, new),
+            event=("task_target_changed", f"target changed from {old:.1f} C to {new:.1f} C, the task follows",
+                   {"from_c": old, "to_c": new, "phase": status}))
+        if status == "warming_up":
+            self._new_detector()
+        elif status == "running":
+            wall = self.wall()
+            if self.dips is not None and self.dips.open:
+                self.store.save_excursion(t["task_id"], self.dips.start, wall, self.dips.min_c)
+                self.store.log_event("dip_closed", "target changed, the excursion below the old band is closed",
+                                     t["task_id"], {"start_wall": self.dips.start, "end_wall": wall,
+                                                    "min_temp_c": round(self.dips.min_c, 2)})
+            self._new_detector()
+            task = self.task
+            settle = wall + float(task["warmup_timeout_s"]) if new > old else None
+            self.dips = warmup.DipTracker(task["target_c"] - task["tolerance_c"], task["dip_limit_s"], settle)
 
     def _begin_cooling(self, now):
         """Heater off, fan on until the measured temperature is safe. No-op if already safe."""

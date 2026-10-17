@@ -12,7 +12,8 @@ from temp_history import HUMIDITY, SENSORS, placed_ms, record_key
 ACTIVE_STATUSES = ("starting", "warming_up", "running", "recovering", "recovery_required")
 
 # Columns added after the first release, applied to existing databases on open. The *_c / *_s
-# snapshot columns are copied from config when a task starts and never change afterwards.
+# snapshot columns are copied from config when a task starts and never change afterwards, except the target and
+# the zone floors hanging off it, which follow the saved target (task_manager.retarget_fields).
 TASK_MIGRATIONS = {
     "drying_started_wall": "REAL",      # backdated to the first sample of the qualifying dwell
     "target_confirmed_wall": "REAL",    # when the dwell finished

@@ -299,7 +299,7 @@ def main():
             "safe_temp": tm.safe_temp_c,
             "heater_cutoff": tm.heater_cutoff_c,
             "heater_cutoff_margin": config.HEATER_CUTOFF_MARGIN_C,
-            "target_temp": tm.settings.get("manual_target_temp_c"),  # manual heating and the next task
+            "target_temp": tm.settings.get("manual_target_temp_c"),  # manual heating and any running task
             "target_humidity": tm.settings.get("manual_target_humidity"),
             "settings_updated_at": tm.settings.updated_at,
             "manual_heating": manual.enabled,

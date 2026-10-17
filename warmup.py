@@ -131,11 +131,17 @@ class ZoneDetector:
 
 
 class DipTracker:
-    """Excursions below the band after drying has started. They never stop the timer."""
+    """Excursions below the band after drying has started. They never stop the timer.
 
-    def __init__(self, band_floor_c, limit_s):
+    `settle_until` (wall time) is the grace after the operator RAISES the target mid-task: the chamber is
+    below the new floor only because it has not heated up yet, so that is not an excursion. It ends at the
+    first reading inside the band or at the deadline, so a heater that never gets there still raises the warning.
+    """
+
+    def __init__(self, band_floor_c, limit_s, settle_until=None):
         self.band_floor = band_floor_c
         self.limit_s = limit_s
+        self.settle_until = settle_until
         self.start = None
         self.min_c = None
 
@@ -148,6 +154,11 @@ class DipTracker:
 
     def feed(self, wall, smoothed):
         """Returns ("opened" | "closed" | None, start, end, min_c, warning)."""
+        if self.settle_until is not None:
+            if smoothed >= self.band_floor or wall >= self.settle_until:
+                self.settle_until = None
+            elif self.start is None:
+                return None, None, None, None, False
         if smoothed < self.band_floor:
             if self.start is None:
                 self.start, self.min_c = wall, smoothed

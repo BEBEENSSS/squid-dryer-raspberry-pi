@@ -66,16 +66,17 @@ def test_warmup_timeout_faults_and_turns_the_heater_off(rig, monkeypatch):
     assert rig.tm.machine_status() == "failed"
 
 
-def test_session_settings_are_frozen_at_start(rig, monkeypatch):
+def test_tolerance_and_dwell_are_frozen_at_start_but_the_target_follows_the_setting(rig, monkeypatch):
     rig.start(warmup=True)
     monkeypatch.setattr(config, "TARGET_TOLERANCE_C", 10.0)
     monkeypatch.setattr(config, "DWELL_SECONDS", 1)
-    # the saved target is copied into the task at start: a new target waits for the next task
+    # the saved target is the one target there is: the running task follows it (see test_retarget.py)
     assert rig.tm.apply_settings({"manual_target_temp_c": 46, "updated_at": 1}) == ["manual_target_temp_c"]
     t = drive_to_drying(rig)
-    assert (t["tolerance_c"], t["dwell_s"], t["target_c"]) == (2.5, 60, 55.0)
+    assert (t["tolerance_c"], t["dwell_s"], t["target_c"]) == (2.5, 60, 46.0)
     assert t["target_confirmed_wall"] - t["drying_started_wall"] >= 60
     assert rig.tm.snapshot()["dwell_seconds"] == 60
+    assert rig.tm.snapshot()["target_temp_c"] == 46.0
 
 
 def test_sensor_dropout_during_warmup_faults(rig):

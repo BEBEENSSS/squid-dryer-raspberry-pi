@@ -283,9 +283,9 @@ def test_a_task_runs_on_the_saved_target_and_max(rig):
     t = rig.task()
     assert (t["target_c"], t["max_temp_c"]) == (47.0, 52.0)
     assert rig.tm.snapshot()["target_temp_c"] == 47.0
-    # a new target waits for the next task
+    # a new target is the running task's target too; the safe shutdown stays the one it started with
     rig.tm.apply_settings({"manual_target_temp_c": 46, "updated_at": 101})
-    assert rig.task()["target_c"] == 47.0
+    assert (rig.task()["target_c"], rig.task()["max_temp_c"]) == (46.0, 52.0)
 
 
 def test_the_task_thermostat_holds_the_saved_target_and_stays_under_the_max(rig):
