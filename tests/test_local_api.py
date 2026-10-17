@@ -94,7 +94,7 @@ def test_login_sets_an_httponly_strict_cookie_and_unlocks_writes(api):
     assert "HttpOnly" in flags and "SameSite=Strict" in flags
     resp, raw = call(api, "POST", "/api/commands", {"fan": True, "heater": False, "command_id": "c1"}, cookie)
     assert resp.status == 202 and json.loads(raw)["command_id"] == "c1"
-    assert api.queue.get_nowait() == ("manual", (True, False, "c1", "local"))
+    assert api.queue.get_nowait() == ("manual", (True, False, "c1", "local", False))
     assert json.loads(call(api, "GET", "/api/session", cookie=cookie)[1])["authenticated"] is True
 
 
@@ -250,6 +250,10 @@ def test_port_in_use_does_not_raise(api, tmp_path, web):
 def test_parsers():
     assert parse_manual({"fan": True, "heater": True})[0][:2] == (True, True)
     assert parse_manual({"fan": 1, "heater": False})[1] == "fan_and_heater_must_be_booleans"
+    # a preheat is the fan and the heater together, so it cannot be asked for without both
+    assert parse_manual({"fan": True, "heater": True, "preheat": True, "command_id": "p1"})[0] == (True, True, "p1", True)
+    assert parse_manual({"fan": True, "heater": False, "preheat": True})[1] == "preheat_needs_fan_and_heater"
+    assert parse_manual({"fan": True, "heater": True, "preheat": "yes"})[1] == "preheat_must_be_boolean"
     assert parse_settings({"safe_temp_c": True})[1] == "out_of_range:safe_temp_c"
     assert parse_task_request({"command": "start", "task_id": "bad id!"})[1] == "invalid_task_id"
 

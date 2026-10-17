@@ -42,7 +42,7 @@ def test_fresh_command_is_applied_once_with_its_id(rig):
     sync, q = make(rig, base)
     command(base, "c1", SERVER_NOW - 2000)
     assert sync.sync_once()
-    assert drain(q) == [("manual", (True, False, "c1", "online"))]
+    assert drain(q) == [("manual", (True, False, "c1", "online", False))]
     assert sync.sync_once()
     assert drain(q) == []  # same command_id is never delivered twice
 
@@ -97,7 +97,7 @@ def test_legacy_command_without_id_still_works(rig):
     sync, q = make(rig, base)
     base.data["commands"] = {"fan": True, "heater": False}
     assert sync.sync_once()
-    assert drain(q) == [("manual", (True, False, None, "online"))]
+    assert drain(q) == [("manual", (True, False, None, "online", False))]
 
 
 def test_task_command_age_uses_server_time_not_the_pi_clock(rig):

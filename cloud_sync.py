@@ -164,7 +164,8 @@ class CloudSync:
         # manual commands first: they are the latency-sensitive ones
         cmds = self._base.child("commands").get() or {}
         if isinstance(cmds, dict):
-            manual = (cmds.get("fan") is True, cmds.get("heater") is True)
+            # the third request is a preheat: fan and heater held at the target until the chamber is ready
+            manual = (cmds.get("fan") is True, cmds.get("heater") is True, cmds.get("preheat") is True)
             command_id = cmds.get("command_id")
             if isinstance(command_id, str) and command_id:
                 # new-style command: applied once, and only while it is recent
@@ -173,14 +174,15 @@ class CloudSync:
                     self._last_manual = manual
                     verdict = self._manual_verdict(cmds.get("issued_at"))
                     if verdict is None:
-                        self.commands.put(("manual", manual + (command_id, "online")))
+                        self.commands.put(("manual", manual[:2] + (command_id, "online", manual[2])))
                     else:
                         self.request_write("commands/heater", False)
+                        self.request_write("commands/preheat", False)
                         self.store().log_event("stale_command_ignored", f"fan/heater command ignored: {verdict}",
                                                data={"command_id": command_id, "reason": verdict})
             elif manual != self._last_manual:
                 self._last_manual = manual
-                self.commands.put(("manual", manual + (None, "online")))
+                self.commands.put(("manual", manual[:2] + (None, "online", manual[2])))
 
         request = self._base.child("task/request").get()
         key = command_key(request)

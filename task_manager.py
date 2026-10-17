@@ -169,6 +169,7 @@ class TaskManager:
         self.wall = wall
         self.cfg = cfg
         self.on_task_start = on_task_start  # e.g. clear manual fan/heater commands
+        self.preheating = lambda: False     # True while manual heating is a preheat (set by the controller)
         self.server_now_ms = None   # callable returning Firebase server time in ms, or None
         self.local_mark = None      # command_age.LocalCommandMark, set by the controller
         self.lock = threading.RLock()
@@ -241,6 +242,14 @@ class TaskManager:
     def temp_max_c(self):
         """The saved safe shutdown temperature: the over-temperature limit for manual heating and for new tasks."""
         return self.settings.get(MAX_KEY)
+
+    def held_at_target(self, reading):
+        """True while the operator is preheating the chamber, which is then warm and heating on purpose.
+
+        A task may start from it: the heater being on is the preheat's thermostat, and a reading near the saved
+        target is not the leftover heat of an earlier run. It stops short of anything the pause would catch, so a
+        hot spot (the heater pause is active, or a sensor is at it) still counts as too hot."""
+        return bool(self.preheating()) and not self.cutoff.active and reading < self.heater_cutoff_c
 
     def task_limit(self, task):
         """The over-temperature limit a task is held to: the maximum it started with, or the saved maximum
@@ -940,7 +949,8 @@ class TaskManager:
             raise Rejected("task_active")
         if self.store.unacknowledged_failure():
             raise Rejected("unacknowledged_failure")
-        if self.out.heater.is_active:
+        preheating = bool(self.preheating())
+        if self.out.heater.is_active and not preheating:
             raise Rejected("heater_in_use")
         if self.out.heater.latched:
             raise Rejected("heater_fault")
@@ -955,8 +965,13 @@ class TaskManager:
             if any(z not in bypass.split(",") for z in unhealthy):
                 raise Rejected("zone_sensor_unavailable")  # the operator may start without it, knowingly
         hot = self.hottest()
-        if (temp if hot is None else hot) >= self.temp_max_c - cfg.TEMP_RESUME_DROP:
+        reading = temp if hot is None else hot
+        if reading >= self.temp_max_c - cfg.TEMP_RESUME_DROP and not self.held_at_target(reading):
             raise Rejected("too_hot")
+        if preheating:
+            # The preheat hands over: the task commits as warming_up before the thermostat may switch the heater
+            # on again, as it always does. The chamber is already warm, so its warm-up confirms after the dwell.
+            self.out.heater.off()
 
         snap = session_snapshot(cfg, self.settings)
         if self.zones is None:

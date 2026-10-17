@@ -12,13 +12,14 @@ if SIMULATE:
     os.environ.setdefault("GPIOZERO_PIN_FACTORY", "mock")
 
 import config  # noqa: E402
+import preheat  # noqa: E402
 import sd_notify  # noqa: E402
 from cloud_sync import CloudSync, firebase_base  # noqa: E402
 from command_age import LocalCommandMark  # noqa: E402
 from hardware import Outputs, Sensor, SensorArray, make_zone_sensor  # noqa: E402
 from link_monitor import LinkMonitor  # noqa: E402
 from local_api import LocalApi  # noqa: E402
-from machine_settings import shutdown_warning  # noqa: E402
+from machine_settings import TARGET_KEY, shutdown_warning  # noqa: E402
 from netinfo import lan_ip, read_network_status  # noqa: E402
 from network_control import NetworkControl, network_ack_payload  # noqa: E402
 from snapshot import build_snapshot, zone_state  # noqa: E402
@@ -75,8 +76,13 @@ class ManualControl:
         self.last_command_id = None     # newest manual command_id received, even if it was refused
         self.last_command_source = None  # "online", "local" or None
         self.last_command_at = None      # server time (ms) it was received, None when unknown
-        self.wanted = {"fan": False, "heater": False}  # the newest request, from either panel
+        self.wanted = {"fan": False, "heater": False, "preheat": False}  # the newest request, from either panel
         self._latch_seen_off = False
+        # Preheat is manual heating that also judges "ready" (preheat.py). It adds no relay logic of its own: the
+        # thermostat, the pause, the shutdown, the fan interlock and the heater guard below all stay in charge.
+        self.preheat = None            # preheat.PreheatSession while heating or ready
+        self.preheat_status = preheat.OFF
+        self.preheat_reason = None     # why it stopped by itself (a heater block code, or why it never started)
 
     def _event(self, message):
         print(message)
@@ -84,20 +90,77 @@ class ManualControl:
 
     def _reset_heater_command(self):
         self.sync.request_write("commands/heater", False)
+        self.sync.request_write("commands/preheat", False)
 
     def heater_off(self):
         self.out.heater.off()
+
+    @property
+    def preheat_active(self):
+        """Warming the chamber for a task right now: the session is live and the heater is allowed to run."""
+        return self.preheat is not None and self.enabled
+
+    def _end_preheat(self, status=preheat.OFF, reason=None):
+        self.preheat = None
+        self.preheat_status, self.preheat_reason = status, reason
+        if status == preheat.FAILED:
+            self.wanted["preheat"] = False  # the request is spent, as the Firebase one is reset (local panel mirror)
+
+    def _begin_preheat(self):
+        if self.preheat is not None:
+            return  # asked again while it runs: the same session goes on, its timeout is not reset
+        tm, cfg = self.tm, self.cfg
+        zones = tm.zones
+        control = tm.control_zone
+        names = tuple(zones.sensors) if zones is not None else (control,)
+        # a middle or top sensor that is not reading is not waited for (the drying start asks the operator about it)
+        required = tuple(z for z in names if z == control or zones is None or zones.healthy(z))
+        self.preheat = preheat.PreheatSession(
+            target_c=tm.settings.get(TARGET_KEY), tolerance_c=cfg.TARGET_TOLERANCE_C, dwell_s=cfg.DWELL_SECONDS,
+            window=cfg.MEDIAN_WINDOW, max_gap_s=cfg.DWELL_MAX_GAP_SECONDS, timeout_s=cfg.WARMUP_TIMEOUT_SECONDS,
+            allowance=getattr(cfg, "ZONE_FLOOR_ALLOWANCE_C", {}), control=control, zones=names, required=required,
+            mono=self.mono, wall=tm.wall)
+        self.preheat_status, self.preheat_reason = preheat.HEATING, None
+        self._event(f"preheat started, target {self.preheat.target_c:.1f} C")
+
+    def _sensors(self):
+        zones = self.tm.zones
+        return dict(zones.sensors) if zones is not None else {self.tm.control_zone: self.sensor}
+
+    def _tick_preheat(self):
+        """Judge the chamber and stop for the two reasons the thermostat cannot see. Runs after `_regulate`."""
+        session, tm = self.preheat, self.tm
+        if session.target_c != tm.settings.get(TARGET_KEY):
+            session.rebuild(tm.settings.get(TARGET_KEY))  # a new saved target: the hold starts over
+            self._event(f"preheat target changed to {session.target_c:.1f} C")
+        zones = tm.zones
+        if zones is not None:
+            for zone in session.required:
+                if zone != session.control and not zones.healthy(zone):
+                    return self._disable(f"preheat stopped: the {zone} temperature sensor stopped reading",
+                                         "zone_sensor_failure")
+        before = self.preheat_status
+        self.preheat_status = session.update(self._sensors())
+        if self.preheat_status == preheat.READY and before != preheat.READY and session.ready_wall is not None:
+            self._event(f"preheat ready, every zone is in its band at target {session.target_c:.1f} C")
+        if session.timed_out():
+            self._disable("preheat stopped: the target was not reached in time", "preheat_timeout")
 
     def _disable(self, reason, block):
         self.enabled = False
         self.block = block
         self.heater_off()
+        if self.preheat is not None:
+            self._end_preheat(preheat.FAILED, block)
         self._reset_heater_command()
         self._event(reason)
 
-    def apply(self, want_fan, want_heater, command_id=None, source=None):
+    def apply(self, want_fan, want_heater, command_id=None, source=None, want_preheat=False):
         """Apply the wanted state from Firebase with the safety rules."""
-        self.wanted = {"fan": bool(want_fan), "heater": bool(want_heater)}
+        want_preheat = bool(want_preheat)
+        if want_preheat:
+            want_fan = want_heater = True  # preheating is the fan and the heater, held at the target
+        self.wanted = {"fan": bool(want_fan), "heater": bool(want_heater), "preheat": want_preheat}
         if command_id is not None:
             self.last_command_id, self.last_command_source = command_id, source
             clock = getattr(self.sync, "server_clock", None)
@@ -114,6 +177,9 @@ class ManualControl:
         if self.tm.busy():
             if want_fan or want_heater:
                 self._event("manual command ignored: drying task active")
+            if want_preheat:
+                self._end_preheat(preheat.FAILED, "task_active")
+                self.sync.request_write("commands/preheat", False)
             return
         if self.tm.cooling_active():
             # cooling is driven by the measured temperature, not by a stale request
@@ -121,6 +187,9 @@ class ManualControl:
                 self._event("manual command ignored: machine is cooling")
                 self.sync.request_write("commands/heater", False)
                 self.sync.request_write("commands/fan", False)
+            if want_preheat:
+                self._end_preheat(preheat.FAILED, "cooling")
+                self.sync.request_write("commands/preheat", False)
             return
         fan = self.out.fan
 
@@ -152,6 +221,14 @@ class ManualControl:
             self.enabled = True
             self.block = None
             self._regulate()
+
+        if want_preheat:
+            if self.enabled:
+                self._begin_preheat()
+            elif self.preheat is not None or reject:
+                self._end_preheat(preheat.FAILED, self.block)  # the heater was refused: nothing is warming up
+        elif self.preheat is not None or self.preheat_status != preheat.OFF:
+            self._end_preheat()  # asked to stop (or a manual command that is not a preheat): back to off, failure forgotten
 
         if reject:
             self._reset_heater_command()
@@ -185,6 +262,8 @@ class ManualControl:
         """Faults, reboot block and thermostat for manual heating."""
         if self.tm.busy() or self.tm.cooling_active():
             self.enabled = False
+            if self.preheat is not None:
+                self._end_preheat()  # a task took over (it warms the chamber itself) or the machine is cooling
             return
 
         # first contact after boot: clear any stale heater command before it can apply
@@ -195,6 +274,8 @@ class ManualControl:
 
         if self.enabled:
             self._regulate()
+            if self.enabled and self.preheat is not None:
+                self._tick_preheat()
         elif self.out.heater.is_active:
             self.heater_off()  # nothing asked for heat, so nothing may be heating
         # keep the pause latch current while idle so the dashboard shows the real condition
@@ -253,6 +334,8 @@ def main():
         # a stale manual command must not take over when the task ends
         sync.request_write("commands/heater", False)
         sync.request_write("commands/fan", False)
+        sync.request_write("commands/preheat", False)
+        manual.wanted = {"fan": False, "heater": False, "preheat": False}  # the local panel's mirror of the reset
 
     tm = TaskManager(store, out, sensor, boot_id, clock_synced, on_task_start=on_task_start, zones=zones)
 
@@ -280,6 +363,10 @@ def main():
         hot = tm.hottest()
         hottest_c = (sensor.temp_c if hot is None else hot) if ok else None
         cool_enough = ok and hottest_c < tm.temp_max_c - config.TEMP_RESUME_DROP
+        # A chamber held at the target on purpose is ready for a task, not "too hot" or "heater in use": the
+        # start check lets it through for the same reasons (task_manager.TaskManager.held_at_target).
+        warm_for_task = ok and tm.held_at_target(hottest_c)
+        session = manual.preheat
         return {
             "fan": out.fan.is_active,
             "heater": out.heater.is_active,
@@ -304,8 +391,16 @@ def main():
             "settings_updated_at": tm.settings.updated_at,
             "manual_heating": manual.enabled,
             "heater_block": heater_block(ok),
-            "ready": (machine in ("ready", "cooling") and cool_enough and not out.heater.is_active
-                      and zones.configured()),
+            "ready": (machine in ("ready", "cooling") and (cool_enough or warm_for_task)
+                      and (not out.heater.is_active or warm_for_task) and zones.configured()),
+            # Preheat: the machine's own verdict ("off", "heating", "ready" or "failed" with a reason) and, while it
+            # runs, each zone's reading against its band. None removes the key.
+            "preheat": manual.preheat_status,
+            "preheat_reason": manual.preheat_reason,
+            "preheat_started_at": int(session.started_wall * 1000) if session is not None else None,
+            "preheat_ready_at": int(session.ready_wall * 1000) if session is not None and session.ready_wall else None,
+            "preheat_timeout_seconds": session.timeout_s if session is not None else None,
+            "preheat_zones": session.zones_report() if session is not None else None,
             "command_id": manual.last_command_id,         # None removes the key
             "command_source": manual.last_command_source,
             "command_at": manual.last_command_at,
@@ -346,6 +441,7 @@ def main():
             cloud_online=sync.online, loop_age_s=time.monotonic() - last_tick["at"],
             wifi=network_status(), network_ack=network_ack_payload(netctl.last_ack), link=link.snapshot())
     manual = ManualControl(out, sensor, store, sync, tm)
+    tm.preheating = lambda: manual.preheat_active  # a task may start from a chamber that is held at the target
     tm.server_now_ms = sync.server_clock.now_ms  # command age is judged on server time, not the Pi clock
 
     # get a first reading before the recovery check starts

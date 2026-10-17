@@ -141,7 +141,12 @@ def parse_manual(body):
         command_id = str(uuid.uuid4())
     elif not isinstance(command_id, str) or not 1 <= len(command_id) <= 128:
         return None, "invalid_command_id"
-    return (body["fan"], body["heater"], command_id), None
+    preheat = body.get("preheat", False)
+    if not isinstance(preheat, bool):
+        return None, "preheat_must_be_boolean"
+    if preheat and not (body["fan"] and body["heater"]):
+        return None, "preheat_needs_fan_and_heater"  # it is the two of them held at the target
+    return (body["fan"], body["heater"], command_id, preheat), None
 
 
 def parse_settings(body):
@@ -322,7 +327,7 @@ class LocalApi:
                         if err:
                             return self._json(400, {"error": err})
                         api._mark_local()
-                        api.commands.put(("manual", parsed + ("local",)))
+                        api.commands.put(("manual", parsed[:3] + ("local", parsed[3])))
                         return self._json(202, {"command_id": parsed[2]})
                     if path == "/api/settings":
                         parsed, err = parse_settings(body)
